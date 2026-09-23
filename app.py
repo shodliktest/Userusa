@@ -1,5 +1,6 @@
 import streamlit as st
 from pathlib import Path
+from datetime import datetime, timezone
 from userbot.client import UserBotController
 from config.settings import load_settings, save_settings
 from storage.database import Database
@@ -11,6 +12,35 @@ db = Database()
 
 st.title("🤖 Telegram Quiz UserBot")
 st.caption("Mustaqil Streamlit + Telethon + Groq loyihasi")
+
+# --- UserBot holati (heartbeat) ---
+STALE_AFTER = 45  # soniya — shu vaqtdan ortiq yangilanmasa, offline hisoblanadi
+
+hb = db.get_heartbeat()
+if not hb or not hb.get("updated_at"):
+    st.warning("⚪ UserBot holati noma'lum — hali birorta ishga tushish yozuvi yo'q. Worker alohida ishga tushirilganmi, tekshiring.")
+else:
+    updated = datetime.fromisoformat(hb["updated_at"]).replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - updated).total_seconds()
+    status = hb.get("status", "")
+    detail = hb.get("detail", "")
+
+    if age > STALE_AFTER:
+        st.error(f"🔴 UserBot offline ko'rinadi — oxirgi signal {int(age)} soniya oldin ({status}).")
+    elif status == "running":
+        label = f" ({detail})" if detail else ""
+        st.success(f"🟢 UserBot ishlayapti{label} — {int(age)} soniya oldin tasdiqlangan.")
+    elif status == "reconnecting":
+        st.warning(f"🟡 UserBot qayta ulanmoqda — {int(age)} soniya oldin.")
+    elif status == "error":
+        st.error(f"🔴 UserBot xatolik bilan to'xtagan: {detail}")
+    elif status == "stopped":
+        st.error("🔴 UserBot to'xtatilgan.")
+    else:
+        st.info(f"Holat: {status} — {int(age)} soniya oldin.")
+
+    if st.button("🔄 Holatni yangilash"):
+        st.rerun()
 
 with st.sidebar:
     st.header("⚙️ Sozlamalar")
