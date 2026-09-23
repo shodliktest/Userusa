@@ -1,0 +1,9 @@
+{
+  "api_id": "YOUR_API_ID",
+  "api_hash": "YOUR_API_HASH",
+  "phone": "+998...",
+  "session_name": "quiz_userbot",
+  "groq_api_key": "YOUR_GROQ_KEY",
+  "groq_model": "openai/gpt-oss-120b",
+  "auto_reply": true
+}
