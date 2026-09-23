@@ -1,0 +1,5 @@
+streamlit>=1.48
+telethon>=1.41,<2
+groq>=0.31.0
+pandas>=2.2
+python-dotenv>=1.0
