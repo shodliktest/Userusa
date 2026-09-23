@@ -51,6 +51,12 @@ class Database:
                 message TEXT,
                 created_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS heartbeat(
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                status TEXT,
+                detail TEXT,
+                updated_at TEXT
+            );
             """)
 
     def add_source(self,source):
@@ -97,6 +103,18 @@ class Database:
         with self.conn() as c:
             rows=c.execute("SELECT created_at,level,message FROM logs ORDER BY id DESC LIMIT 500").fetchall()
         return "\n".join(f"[{a}] {b}: {d}" for a,b,d in rows)
+
+    def set_heartbeat(self,status,detail=""):
+        with self.conn() as c:
+            c.execute("""INSERT INTO heartbeat(id,status,detail,updated_at) VALUES(1,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET status=excluded.status,detail=excluded.detail,updated_at=excluded.updated_at""",
+            (status,detail,datetime.utcnow().isoformat()))
+
+    def get_heartbeat(self):
+        with self.conn() as c:
+            row=c.execute("SELECT status,detail,updated_at FROM heartbeat WHERE id=1").fetchone()
+        if not row:return None
+        return {"status":row[0],"detail":row[1],"updated_at":row[2]}
 
     def export_quizzes(self,fmt):
         Path("exports").mkdir(exist_ok=True)
