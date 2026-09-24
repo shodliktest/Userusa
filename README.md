@@ -1,64 +1,20 @@
-# Telegram Quiz UserBot — Standalone
+# Telegram Quiz UserBot Pro
 
-Bu loyiha avvalgi Quiztime botdan mustaqil. U faqat o'z repositorysi, SQLite bazasi va Telegram user sessionidan foydalanadi.
+Alohida loyiha: Streamlit + Telethon + Groq.
 
-## Asosiy imkoniyatlar
+- Background UserBot
+- Groq `GROQ_API_KEY` + `GROQ_API_KEY1` ... `GROQ_API_KEY9` pool
+- 429/rate-limit bo'lsa key cooldown va keyingisiga o'tish
+- Kuchli buyurtma operatori prompti
+- Kanal/guruhdan native Telegram quiz scan
+- Manba bo'yicha target soni va TXT fayl hajmi
+- Fingerprint/dedup
+- URL/t.me/telegram.me/@username reklamalarini tozalash
+- Native correct answer ko'rinsa ishlatish; aks holda Groq fallback
+- Past confidence quiz saqlanmaydi
+- TXT: `1. Savol`, `A)`, `*B)`, `Izoh:` faqat mavjud bo'lsa
+- Native Quiz publisher adapteri mavjud
 
-- Streamlit boshqaruv paneli
-- Telethon orqali Telegram UserBot
-- Groq API orqali AI operator
-- Operator roli `config/agent_prompt.txt` orqali boshqariladi
-- Buyurtma suhbatlarini AI orqali olib borish
-- Kanal/guruh manbalarini saqlash
-- Quiz fingerprint/deduplication
-- SQLite storage
-- TXT/JSON eksport
-- Rate limiter asoslari
-- Telegram FLOOD_WAIT holatini hisobga oladigan arxitektura
+Telegram MTProto arbitrary anonymous quizlarning original correct answerini har doim oddiy poll obyektida bermaydi. Shu sabab native flag birinchi tekshiriladi, keyin Groq fallback ishlaydi. AI javobi ham ishonch chegarasidan past bo'lsa quiz verified sifatida saqlanmaydi.
 
-## Sozlash (barchasi Streamlit Secrets orqali)
-
-Hech qanday API kalit yoki sessiya UI'dan kiritilmaydi yoki diskka yozilmaydi.
-Barcha maxfiy qiymatlar Streamlit Secrets orqali beriladi.
-
-1. `my.telegram.org` orqali `TELEGRAM_API_ID` va `TELEGRAM_API_HASH` oling.
-2. Session string generatsiya qiling (mahalliy kompyuteringizda, bir marta):
-   ```bash
-   pip install telethon
-   python generate_session_string.py
-   ```
-   Telefon raqam va OTP kodni so'raydi, so'ngra `TELEGRAM_SESSION_STRING` qiymatini chiqaradi.
-3. `.streamlit/secrets.toml.example` faylini `.streamlit/secrets.toml` deb nusxalang
-   (mahalliy sinov uchun) va qiymatlarni to'ldiring; yoki Streamlit Cloud'da
-   **App → Settings → Secrets** bo'limiga xuddi shu formatda joylashtiring:
-   ```toml
-   TELEGRAM_API_ID = "..."
-   TELEGRAM_API_HASH = "..."
-   TELEGRAM_SESSION_STRING = "..."
-   GROQ_API_KEY = "..."
-   ```
-   Model nomi kodning ichida (`config/settings.py`) qattiq yozilgan — alohida sozlash shart emas.
-4. Ishga tushiring:
-   ```bash
-   pip install -r requirements.txt
-   streamlit run app.py
-   ```
-
-## UserBot qanday ishlaydi
-
-UserBot alohida process sifatida emas, Streamlit ilovasi ochilganda **background
-thread** sifatida avtomatik ishga tushadi (QuizMarker botidagi thread+polling
-naqshiga o'xshab). Sahifa yuqorisidagi holat ko'rsatkichi (🟢/🟡/🔴/⚪) worker
-tirikligini har safar sahifa yangilanganda ko'rsatadi.
-
-Diqqat: Streamlit Community Cloud ilovani harakatsizlikdan keyin "uxlatishi"
-yoki qayta deploy qilishi mumkin — bunday holatda thread ham qayta boshlanadi
-va sahifa birinchi ochilganda biroz sekinroq javob berishi mumkin.
-
-## Muhim
-
-Telegram rate limitlarini chetlab o'tish uchun agressiv parallel request, proxy rotation yoki boshqa bypass ishlatilmaydi. Scanner deduplication, throttling va `FLOOD_WAIT`ni kutish mexanizmi bilan ishlashi kerak.
-
-### Native Telegram Quiz
-
-Telegramdagi anonim quizdan API orqali olingan ma'lumotlarda correct answer har doim oddiy xabar obyektida mavjud bo'lmasligi mumkin. Shuning uchun native quizning to'g'ri javobini olish/publish qilish qismi Telethon versiyasi va API imkoniyatlariga qarab alohida adapter bilan yakuniy test qilinishi kerak. Noto'g'ri javobni AI bilan taxmin qilib belgilash default holatda qilinmaydi.
+Telegram API limitlarini bypass qilish uchun proxy/key rotation ishlatilmaydi; Groq key rotation faqat Groq limitlarida ishlaydi.
