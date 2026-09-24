@@ -1,35 +1,17 @@
+from dataclasses import dataclass
 import streamlit as st
-
-DEFAULT={
-    "session_name":"quiz_userbot",
-    "groq_model":"openai/gpt-oss-120b",
-    "auto_reply":True
-}
-
+@dataclass
+class Settings:
+    api_id:int; api_hash:str; phone:str; session_string:str; groq_model:str; groq_keys:list; quiz_ai_fallback:bool; quiz_ai_min_confidence:float
+def sec(k,d=None):
+    try:return st.secrets.get(k,d)
+    except Exception:return d
 def load_settings():
-    """Barcha maxfiy sozlamalar Streamlit secrets orqali olinadi
-    (.streamlit/secrets.toml mahalliyda, yoki Streamlit Cloud'ning
-    'Secrets' bo'limi production'da). Hech qanday API kalit yoki
-    sessiya diskka yozilmaydi."""
-    s = st.secrets if hasattr(st, "secrets") else {}
-    return {
-        "api_id": s.get("TELEGRAM_API_ID", ""),
-        "api_hash": s.get("TELEGRAM_API_HASH", ""),
-        "phone": s.get("TELEGRAM_PHONE", ""),
-        "session_string": s.get("TELEGRAM_SESSION_STRING", ""),
-        "session_name": DEFAULT["session_name"],
-        "groq_api_key": s.get("GROQ_API_KEY", ""),
-        "groq_model": DEFAULT["groq_model"],
-        "auto_reply": DEFAULT["auto_reply"],
-    }
-
+    keys=[]
+    for i in range(10):
+        k='GROQ_API_KEY' if i==0 else f'GROQ_API_KEY{i}'
+        v=sec(k,'')
+        if v and str(v).strip():keys.append(str(v).strip())
+    return Settings(int(sec('TELEGRAM_API_ID',0) or 0),str(sec('TELEGRAM_API_HASH','') or ''),str(sec('TELEGRAM_PHONE','') or ''),str(sec('TELEGRAM_SESSION_STRING','') or ''),str(sec('GROQ_MODEL','openai/gpt-oss-120b')),keys,bool(sec('QUIZ_AI_FALLBACK',True)),float(sec('QUIZ_AI_MIN_CONFIDENCE',.78)))
 def missing_secrets():
-    """UI uchun: qaysi majburiy secretlar hali kiritilmagan."""
-    s = load_settings()
-    required = {
-        "TELEGRAM_API_ID": s["api_id"],
-        "TELEGRAM_API_HASH": s["api_hash"],
-        "TELEGRAM_SESSION_STRING": s["session_string"],
-        "GROQ_API_KEY": s["groq_api_key"],
-    }
-    return [k for k, v in required.items() if not v]
+    s=load_settings(); return ([x for x,v in [('TELEGRAM_API_ID',s.api_id),('TELEGRAM_API_HASH',s.api_hash),('TELEGRAM_SESSION_STRING',s.session_string),('GROQ_API_KEY',s.groq_keys)] if not v])
