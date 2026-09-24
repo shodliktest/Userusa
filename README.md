@@ -16,26 +16,44 @@ Bu loyiha avvalgi Quiztime botdan mustaqil. U faqat o'z repositorysi, SQLite baz
 - Rate limiter asoslari
 - Telegram FLOOD_WAIT holatini hisobga oladigan arxitektura
 
-## Ishga tushirish
+## Sozlash (barchasi Streamlit Secrets orqali)
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+Hech qanday API kalit yoki sessiya UI'dan kiritilmaydi yoki diskka yozilmaydi.
+Barcha maxfiy qiymatlar Streamlit Secrets orqali beriladi.
 
-Telegram API ma'lumotlari uchun `my.telegram.org` orqali API ID va API HASH oling.
+1. `my.telegram.org` orqali `TELEGRAM_API_ID` va `TELEGRAM_API_HASH` oling.
+2. Session string generatsiya qiling (mahalliy kompyuteringizda, bir marta):
+   ```bash
+   pip install telethon
+   python generate_session_string.py
+   ```
+   Telefon raqam va OTP kodni so'raydi, so'ngra `TELEGRAM_SESSION_STRING` qiymatini chiqaradi.
+3. `.streamlit/secrets.toml.example` faylini `.streamlit/secrets.toml` deb nusxalang
+   (mahalliy sinov uchun) va qiymatlarni to'ldiring; yoki Streamlit Cloud'da
+   **App → Settings → Secrets** bo'limiga xuddi shu formatda joylashtiring:
+   ```toml
+   TELEGRAM_API_ID = "..."
+   TELEGRAM_API_HASH = "..."
+   TELEGRAM_SESSION_STRING = "..."
+   GROQ_API_KEY = "..."
+   ```
+   Model nomi kodning ichida (`config/settings.py`) qattiq yozilgan — alohida sozlash shart emas.
+4. Ishga tushiring:
+   ```bash
+   pip install -r requirements.txt
+   streamlit run app.py
+   ```
 
-Groq API keyni Streamlit panelidan kiriting yoki `GROQ_API_KEY` environment variable sifatida bering.
+## UserBot qanday ishlaydi
 
-## UserBotni ishga tushirish
+UserBot alohida process sifatida emas, Streamlit ilovasi ochilganda **background
+thread** sifatida avtomatik ishga tushadi (QuizMarker botidagi thread+polling
+naqshiga o'xshab). Sahifa yuqorisidagi holat ko'rsatkichi (🟢/🟡/🔴/⚪) worker
+tirikligini har safar sahifa yangilanganda ko'rsatadi.
 
-Streamlit UI boshqaruv uchun. Doimiy UserBot workerini alohida process/hostingda ishga tushirish tavsiya qilinadi:
-
-```bash
-python -c "from userbot.client import UserBotController; UserBotController().start()"
-```
-
-Birinchi ishga tushishda Telegram login/OTP jarayoni bo'ladi.
+Diqqat: Streamlit Community Cloud ilovani harakatsizlikdan keyin "uxlatishi"
+yoki qayta deploy qilishi mumkin — bunday holatda thread ham qayta boshlanadi
+va sahifa birinchi ochilganda biroz sekinroq javob berishi mumkin.
 
 ## Muhim
 
