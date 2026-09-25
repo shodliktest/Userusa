@@ -21,7 +21,7 @@ class Worker:
         self.scanning = False
         self.scan_future = None
         self.stop_event = threading.Event()
-        self.stats = {'status': 'stopped', 'source': '', 'checked': 0, 'found': 0, 'skipped': 0, 'published': 0, 'error': ''}
+        self.stats = {'status': 'stopped', 'source': '', 'checked': 0, 'found': 0, 'skipped': 0, 'published': 0, 'files_sent': 0, 'error': ''}
         self.hist = {}
         self.lock = threading.RLock()
 
@@ -91,7 +91,7 @@ class Worker:
                 return False
             self.stop_event.clear()
             self.scanning = True
-            self.stats = {'status': 'starting', 'source': '', 'checked': 0, 'found': 0, 'skipped': 0, 'published': 0, 'error': ''}
+            self.stats = {'status': 'starting', 'source': '', 'checked': 0, 'found': 0, 'skipped': 0, 'published': 0, 'files_sent': 0, 'error': ''}
             self.db.log('INFO', f'Scanner START: {len(rows)} source')
             self.scan_future = asyncio.run_coroutine_threadsafe(self._scan_all(rows), self.loop)
             return True
@@ -109,6 +109,8 @@ class Worker:
                         self.stop_event, self.s, self.stats,
                         output_chat=str(row.get('output_chat') or '').strip(),
                         publish_enabled=bool(row.get('publish_enabled', 0)),
+                        file_publish_enabled=bool(row.get('file_publish_enabled', 1)),
+                        per_file=int(row.get('per_file', 20) or 20),
                     )
                     self.db.log('INFO', f'Scan DONE: {source}; found={n}')
                 except Exception as exc:

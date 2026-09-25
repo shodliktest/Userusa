@@ -240,10 +240,34 @@ async def telegram_correct_index(client, src, msg, poll, answers):
     raise ValueError(f'Telegram anonymous quiz correct answer unavailable: {reason}; msg_id={msg.id}')
 
 
-async def scan(client, db, src, target, stop_event, settings, stats, output_chat='', publish_enabled=False):
-    found = checked = skipped = published = 0
+async def _send_docx_batch(client, output_chat, records):
+    if not records or not output_chat:
+        return None
+    from utils.exporter import export
+    files = export(records, len(records), 'quiz_test')
+    sent = 0
+    try:
+        for path in files:
+            await client.send_file(
+                await client.get_input_entity(output_chat),
+                str(path),
+                caption=f'Quizlar: {len(records)} ta\nManba: {records[0].get("source", "")}',
+            )
+            sent += 1
+    finally:
+        for path in files:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return sent
+
+
+async def scan(client, db, src, target, stop_event, settings, stats, output_chat='', publish_enabled=False, file_publish_enabled=True, per_file=20):
+    found = checked = skipped = published = files_sent = 0
+    batch_records = []
     state = db.state(src)
-    stats.update(status='starting', source=str(src), found=0, checked=0, skipped=0, published=0, error='')
+    stats.update(status='starting', source=str(src), found=0, checked=0, skipped=0, published=0, files_sent=0, error='')
 
     try:
         # Start from newest messages. We keep a checkpoint so a later run can skip
@@ -257,7 +281,7 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
 
             checked += 1
             stats.update(status='scanning', source=str(src), found=found, checked=checked,
-                         skipped=skipped, published=published)
+                         skipped=skipped, published=published, files_sent=files_sent)
 
             data = pdata(msg)
             if not data:
@@ -297,6 +321,7 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
             db.savefp(fp, src, msg.id)
             db.save(record)
             found += 1
+            batch_records.append(record)
 
             if publish_enabled and output_chat:
                 try:
@@ -307,14 +332,32 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
                 except Exception as exc:
                     db.log('ERROR', f'Publish failed for {q[:80]}: {exc}')
 
+            if file_publish_enabled and output_chat and len(batch_records) >= max(1, int(per_file)):
+                try:
+                    sent = await _send_docx_batch(client, output_chat, batch_records)
+                    files_sent += int(sent or 0)
+                    db.log('INFO', f'DOCX yuborildi: {output_chat}; {len(batch_records)} quiz; files={sent or 0}')
+                    batch_records.clear()
+                except Exception as exc:
+                    db.log('ERROR', f'DOCX yuborish xatosi {output_chat}: {exc}')
+
             db.save_state(src, last_message_id=msg.id,
                           checked=state.get('checked', 0) + checked,
                           found=state.get('found', 0) + found)
-            stats.update(found=found, checked=checked, skipped=skipped, published=published)
+            stats.update(found=found, checked=checked, skipped=skipped, published=published, files_sent=files_sent)
 
             if target and found >= int(target):
                 break
             await asyncio.sleep(0.8)
+
+        if batch_records and file_publish_enabled and output_chat:
+            try:
+                sent = await _send_docx_batch(client, output_chat, batch_records)
+                files_sent += int(sent or 0)
+                db.log('INFO', f'DOCX yuborildi: {output_chat}; {len(batch_records)} quiz; files={sent or 0}')
+                batch_records.clear()
+            except Exception as exc:
+                db.log('ERROR', f'DOCX yuborish xatosi {output_chat}: {exc}')
 
     except errors.FloodWaitError as exc:
         wait = int(getattr(exc, 'seconds', 0))
@@ -329,5 +372,5 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
             stats['status'] = 'stopped'
         elif stats.get('status') not in ('error', 'flood_wait'):
             stats['status'] = 'completed'
-        stats.update(found=found, checked=checked, skipped=skipped, published=published)
+        stats.update(found=found, checked=checked, skipped=skipped, published=published, files_sent=files_sent)
     return found
