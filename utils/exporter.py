@@ -8,6 +8,7 @@ from docx.enum.text import WD_BREAK
 from docx.shared import Cm, Pt, RGBColor
 
 
+
 def _plain(value: Any) -> str:
     if value is None:
         return ''
@@ -104,13 +105,27 @@ def export(quizzes, n=20, name='quiz_test'):
         section.left_margin = Cm(2.0)
         section.right_margin = Cm(2.0)
 
-        title = doc.add_paragraph()
-        title.alignment = 1
-        r = title.add_run(text(base))
-        r.bold = True
-        r.font.size = Pt(14)
+        # For user-submitted image+quiz collections, the first content must be the image.
+        # A short title is omitted when the generated name came from the first question.
+        explicit_title = bool(name and name.strip() and name.strip().lower() != 'quiz_test')
+        if explicit_title:
+            title = doc.add_paragraph()
+            title.alignment = 1
+            r = title.add_run(text(base))
+            r.bold = True
+            r.font.size = Pt(14)
 
         for i, q in enumerate(batch, 1):
+            image_path = text(q.get('image_path', ''))
+            if image_path and Path(image_path).is_file():
+                try:
+                    pic = doc.add_picture(image_path, width=Cm(15.5))
+                    if pic and pic.paragraphs:
+                        pic.paragraphs[0].alignment = 1
+                except Exception:
+                    # A bad/missing image must not destroy the whole batch.
+                    pass
+
             question = text(q.get('question', ''))
             qp = doc.add_paragraph()
             qp.paragraph_format.space_before = Pt(8)
