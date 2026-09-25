@@ -41,7 +41,7 @@ with t[1]:
     src = st.text_input('Kanal/Guruh', placeholder='@kanal yoki -100...')
     c1, c2, c3 = st.columns(3)
     target = c1.number_input('Manbadan nechta quiz?', min_value=1, max_value=100000, value=100)
-    pf = c2.number_input('Har TXT faylda nechta?', min_value=1, max_value=1000, value=20)
+    pf = c2.number_input('Har DOCX faylda nechta?', min_value=1, max_value=1000, value=20)
     out = c3.text_input('Quiz yuboriladigan kanal/guruh (ixtiyoriy)', placeholder='@mening_kanalim')
     publish = st.checkbox('Topilgan quizlarni native Telegram Quiz sifatida yuborish', value=False)
 
@@ -56,7 +56,7 @@ with t[1]:
     if rows:
         display_rows = [{
             'Manba': r['source'], 'Yoqilgan': bool(r.get('enabled', 1)),
-            'Maqsad': r['target_count'], 'TXT': r['per_file'],
+            'Maqsad': r['target_count'], 'DOCX': r['per_file'],
             'Output': r.get('output_chat', ''), 'Publish': bool(r.get('publish_enabled', 0))
         } for r in rows]
         st.dataframe(display_rows, width='stretch')
@@ -92,15 +92,15 @@ with t[1]:
 
 with t[2]:
     srcf = st.text_input('Manba filter (ixtiyoriy)')
-    n = st.number_input('Har faylda testlar', 1, 1000, 20)
+    n = st.number_input('Har DOCX faylda testlar', 1, 1000, 20)
     name = st.text_input('Fayl nomi/mavzu', 'quiz_test')
-    if st.button('📄 TXT tayyorlash'):
+    if st.button('📄 DOCX tayyorlash'):
         qs = db.quizzes(srcf.strip() or None)
         if not qs:
             st.warning('Export qilish uchun hali saqlangan quiz yo‘q. Avval Scanner orqali quizlarni yig‘ing.')
         else:
             for p in export(qs, n, name):
-                st.download_button('⬇️ ' + p.name, p.read_bytes(), file_name=p.name, mime='text/plain', key='dl_' + p.name)
+                st.download_button('⬇️ ' + p.name, p.read_bytes(), file_name=p.name, mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document', key='dl_' + p.name)
 
 with t[3]:
     for label, tbl in [('Quizlar', 'quizzes'), ('Fingerprintlar', 'fingerprints'), ('Buyurtmalar', 'orders')]:
