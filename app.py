@@ -34,7 +34,7 @@ with t[0]:
     if st.button('💾 Promptni saqlash'):
         p.write_text(x, encoding='utf-8')
         st.success('Saqlandi')
-    st.caption(f'Groq keylar: {len(s.groq_keys)} | 429 bo‘lsa key avtomatik almashtiriladi')
+    st.caption(f'Groq keylar: {len(s.groq_keys)} | Groq faqat operator uchun ishlatiladi; quiz javobini aniqlashda AI ishlatilmaydi.')
 
 with t[1]:
     st.subheader('📡 Scanner')
@@ -88,7 +88,7 @@ with t[1]:
     m4.metric('Yuborilgan', w.stats.get('published', 0))
     if w.stats.get('error'):
         st.error(w.stats['error'])
-    st.caption('Statusni real vaqtda ko‘rish uchun “🔄 HOLATNI YANGILASH” tugmasini bosing.')
+    st.caption('Statusni yangilash uchun “🔄 HOLATNI YANGILASH” tugmasini bosing. Quiz javobi Telegram pollResults orqali olinadi.')
 
 with t[2]:
     srcf = st.text_input('Manba filter (ixtiyoriy)')
