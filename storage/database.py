@@ -30,6 +30,7 @@ class Database:
                 per_file INTEGER DEFAULT 20,
                 output_chat TEXT DEFAULT '',
                 publish_enabled INTEGER DEFAULT 0,
+                file_publish_enabled INTEGER DEFAULT 1,
                 created_at TEXT
             );
             CREATE TABLE IF NOT EXISTS fingerprints(
@@ -62,6 +63,8 @@ class Database:
             cols = {r[1] for r in x.execute('PRAGMA table_info(sources)')}
             if 'publish_enabled' not in cols:
                 x.execute('ALTER TABLE sources ADD COLUMN publish_enabled INTEGER DEFAULT 0')
+            if 'file_publish_enabled' not in cols:
+                x.execute('ALTER TABLE sources ADD COLUMN file_publish_enabled INTEGER DEFAULT 1')
             if 'enabled' not in cols:
                 x.execute('ALTER TABLE sources ADD COLUMN enabled INTEGER DEFAULT 1')
             if 'answer_source' not in {r[1] for r in x.execute('PRAGMA table_info(quizzes)')}:
@@ -73,18 +76,19 @@ class Database:
         with self.c() as x:
             return [dict(r) for r in x.execute('SELECT * FROM sources ORDER BY id DESC')]
 
-    def add_source(self, s, n=100, pf=20, out='', publish_enabled=0):
+    def add_source(self, s, n=100, pf=20, out='', publish_enabled=0, file_publish_enabled=1):
         s = str(s).strip()
         with self.c() as x:
-            x.execute('''INSERT INTO sources(source,target_count,per_file,output_chat,publish_enabled,created_at)
-                         VALUES(?,?,?,?,?,?)
+            x.execute('''INSERT INTO sources(source,target_count,per_file,output_chat,publish_enabled,file_publish_enabled,created_at)
+                         VALUES(?,?,?,?,?,?,?)
                          ON CONFLICT(source) DO UPDATE SET
                            target_count=excluded.target_count,
                            per_file=excluded.per_file,
                            output_chat=excluded.output_chat,
                            publish_enabled=excluded.publish_enabled,
+                           file_publish_enabled=excluded.file_publish_enabled,
                            enabled=1''',
-                      (s, int(n), int(pf), str(out).strip(), int(bool(publish_enabled)), now()))
+                      (s, int(n), int(pf), str(out).strip(), int(bool(publish_enabled)), int(bool(file_publish_enabled)), now()))
 
     def set_source_enabled(self, source, enabled):
         with self.c() as x:
