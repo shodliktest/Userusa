@@ -4,7 +4,8 @@ import json
 import re
 from typing import Any
 
-from telethon import functions, errors, types
+from telethon import errors, types
+from telethon.tl.functions.messages import GetPollResultsRequest, SendVoteRequest
 
 URL = re.compile(r'(?:https?://|t\.me/|telegram\.me/)[^\s]+|(?<!\w)@[A-Za-z0-9_]{3,}', re.I)
 
@@ -61,7 +62,12 @@ def poll_from_message(msg):
 
 def pdata(msg):
     poll = poll_from_message(msg)
+    # User's sources contain Telegram's anonymous quiz/viktorina polls.
+    # In MTProto: quiz=True + public_voters flag absent/False = anonymous quiz.
+    # Do not collect non-anonymous quizzes here.
     if poll is None or not bool(getattr(poll, 'quiz', False)):
+        return None
+    if bool(getattr(poll, 'public_voters', False)):
         return None
     q = clean(getattr(poll, 'question', None))
     answers = list(getattr(poll, 'answers', None) or [])
@@ -131,23 +137,26 @@ async def _get_results(client, peer, msg, poll):
     poll_hash = int(getattr(poll, 'hash', 0) or 0)
     if not poll_hash:
         return None
-    return await client(functions.messages.GetPollResults(
+    return await client(GetPollResultsRequest(
         peer=peer, msg_id=int(msg.id), poll_hash=poll_hash
     ))
 
 
 async def telegram_correct_index(client, src, msg, poll, answers):
-    """Obtain the quiz answer from Telegram itself; never solve the question with AI.
+    """Read the correct answer from Telegram's anonymous quiz result; never use AI.
 
-    We first use any correct flag already present. Otherwise we cast exactly one vote
-    (the first option). Telegram's MTProto response to messages.sendVote contains
-    PollResults where the correct option is marked with `correct=True`.
-    If this account has already voted and revoting is disabled, we fetch the current
-    poll results instead.
+    Workflow:
+      1) Work with the exact source peer + quiz message ID.
+      2) If Telegram already exposed a correct flag locally, use it.
+      3) Otherwise cast ONE vote on the first option. The MTProto response contains
+         PollResults with ``correct=True`` on the correct answer(s).
+      4) If voting is refused because this account already voted, refresh the SAME
+         message and fetch its current poll results.
+      5) Never infer/guess the answer and never call Groq/Gemini here.
     """
     peer = await client.get_input_entity(src)
 
-    # Existing local poll state may already contain the answer after a previous vote.
+    # 1. Current message state may already contain the answer.
     idx, solution = _correct_from_results(getattr(poll, 'results', None), answers)
     if idx is not None:
         return idx, solution, False
@@ -158,47 +167,77 @@ async def telegram_correct_index(client, src, msg, poll, answers):
 
     response = None
     voted_now = False
+    already_voted = False
     try:
-        response = await client(functions.messages.SendVote(
+        response = await client(SendVoteRequest(
             peer=peer,
             msg_id=int(msg.id),
             options=[bytes(vote_option)],
         ))
         voted_now = True
     except errors.RPCError as exc:
-        # Telethon error class names can vary slightly by generated layer/version.
-        # Only REVOTE_NOT_ALLOWED means 'already voted'; all other RPC errors are real failures.
-        if exc.__class__.__name__ == 'RevoteNotAllowedError' or 'REVOTE_NOT_ALLOWED' in str(exc):
-            response = None
+        name = exc.__class__.__name__
+        if name == 'RevoteNotAllowedError' or 'REVOTE_NOT_ALLOWED' in str(exc):
+            already_voted = True
         else:
             raise
 
+    # 2. Best/authoritative path: inspect the exact sendVote update.
     results = _walk_poll_results(response)
     idx, solution = _correct_from_results(results, answers)
     if idx is not None:
         return idx, solution, voted_now
 
-    # The sendVote response can be minimal; fetch the current state with poll.hash.
-    try:
-        fresh = await _get_results(client, peer, msg, poll)
-        idx, solution = _correct_from_results(_walk_poll_results(fresh) or fresh, answers)
-        if idx is not None:
-            return idx, solution, voted_now
-    except errors.RPCError:
-        pass
-
-    # Last local refresh: Telegram may have delivered the updated poll to the client.
+    # 3. Refresh the exact message ID. This is important when the account voted
+    # earlier or when Telethon's update object does not contain the full result.
+    refreshed_poll = None
     try:
         refreshed_msg = await client.get_messages(peer, ids=int(msg.id))
         refreshed_poll = poll_from_message(refreshed_msg)
         if refreshed_poll is not None:
-            idx, solution = _correct_from_results(getattr(refreshed_poll, 'results', None), answers)
+            idx, solution = _correct_from_results(
+                getattr(refreshed_poll, 'results', None), answers
+            )
             if idx is not None:
                 return idx, solution, voted_now
     except errors.RPCError:
         pass
 
-    return None, solution, voted_now
+    # 4. Ask Telegram for the current results using the latest poll hash.
+    # If the refreshed message is unavailable, use the original poll hash.
+    poll_for_hash = refreshed_poll or poll
+    poll_hash = int(getattr(poll_for_hash, 'hash', 0) or 0)
+    if poll_hash:
+        try:
+            fresh = await client(GetPollResultsRequest(
+                peer=peer,
+                msg_id=int(msg.id),
+                poll_hash=poll_hash,
+            ))
+            idx, solution = _correct_from_results(
+                _walk_poll_results(fresh) or fresh, answers
+            )
+            if idx is not None:
+                return idx, solution, voted_now
+        except errors.RPCError:
+            pass
+
+    # 5. One final exact-message refresh. Do not scan another message and do not
+    # ask an AI model to infer the answer.
+    try:
+        refreshed_msg = await client.get_messages(peer, ids=int(msg.id))
+        refreshed_poll = poll_from_message(refreshed_msg)
+        if refreshed_poll is not None:
+            idx, solution = _correct_from_results(
+                getattr(refreshed_poll, 'results', None), answers
+            )
+            if idx is not None:
+                return idx, solution, voted_now
+    except errors.RPCError:
+        pass
+
+    reason = 'already voted' if already_voted else 'Telegram result not exposed yet'
+    raise ValueError(f'Telegram anonymous quiz correct answer unavailable: {reason}; msg_id={msg.id}')
 
 
 async def scan(client, db, src, target, stop_event, settings, stats, output_chat='', publish_enabled=False):
