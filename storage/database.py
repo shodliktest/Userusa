@@ -48,6 +48,8 @@ class Database:
                 correct_index INTEGER,
                 confidence REAL,
                 explanation TEXT,
+                answer_source TEXT DEFAULT '',
+                voted_now INTEGER DEFAULT 0,
                 raw_json TEXT,
                 created_at TEXT
             );
@@ -62,6 +64,10 @@ class Database:
                 x.execute('ALTER TABLE sources ADD COLUMN publish_enabled INTEGER DEFAULT 0')
             if 'enabled' not in cols:
                 x.execute('ALTER TABLE sources ADD COLUMN enabled INTEGER DEFAULT 1')
+            if 'answer_source' not in {r[1] for r in x.execute('PRAGMA table_info(quizzes)')}:
+                x.execute("ALTER TABLE quizzes ADD COLUMN answer_source TEXT DEFAULT ''")
+            if 'voted_now' not in {r[1] for r in x.execute('PRAGMA table_info(quizzes)')}:
+                x.execute("ALTER TABLE quizzes ADD COLUMN voted_now INTEGER DEFAULT 0")
 
     def sources(self):
         with self.c() as x:
@@ -95,11 +101,11 @@ class Database:
     def save(self, q):
         with self.c() as x:
             x.execute('''INSERT OR IGNORE INTO quizzes
-                (fingerprint,source,message_id,question,options_json,correct_index,confidence,explanation,raw_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                (fingerprint,source,message_id,question,options_json,correct_index,confidence,explanation,answer_source,voted_now,raw_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
                       (q['fingerprint'], q['source'], q['message_id'], q['question'],
                        json.dumps(q['options'], ensure_ascii=False), q['correct_index'],
-                       q['confidence'], q.get('explanation', ''), json.dumps(q, ensure_ascii=False), now()))
+                       q['confidence'], q.get('explanation', ''), q.get('answer_source', ''), int(bool(q.get('voted_now'))), json.dumps(q, ensure_ascii=False), now()))
 
     def quizzes(self, source=None):
         with self.c() as x:
