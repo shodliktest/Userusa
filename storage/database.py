@@ -58,6 +58,26 @@ class Database:
             CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY,level TEXT,message TEXT,created_at TEXT);
             CREATE TABLE IF NOT EXISTS heartbeat(id INTEGER PRIMARY KEY CHECK(id=1),status TEXT,detail TEXT,updated_at TEXT);
             CREATE TABLE IF NOT EXISTS scan_state(source TEXT PRIMARY KEY,last_message_id INTEGER DEFAULT 0,checked INTEGER DEFAULT 0,found INTEGER DEFAULT 0,updated_at TEXT);
+            CREATE TABLE IF NOT EXISTS intake_sessions(
+                user_id INTEGER PRIMARY KEY,
+                pending_image_path TEXT DEFAULT '',
+                updated_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS intake_items(
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                message_id INTEGER,
+                question TEXT,
+                options_json TEXT,
+                correct_index INTEGER,
+                explanation TEXT DEFAULT '',
+                answer_source TEXT DEFAULT 'telegram_poll_results',
+                voted_now INTEGER DEFAULT 0,
+                image_path TEXT DEFAULT '',
+                created_at TEXT,
+                UNIQUE(user_id, fingerprint)
+            );
             ''')
             # Safe migrations for databases created by earlier versions.
             cols = {r[1] for r in x.execute('PRAGMA table_info(sources)')}
@@ -158,6 +178,68 @@ class Database:
         with self.c() as x:
             r = x.execute('SELECT * FROM heartbeat').fetchone()
             return dict(r) if r else None
+
+
+    # --- Private user intake: photo -> quiz pairs -------------------------
+    def intake_set_pending_image(self, user_id, path):
+        with self.c() as x:
+            x.execute("""INSERT INTO intake_sessions(user_id,pending_image_path,updated_at)
+                         VALUES(?,?,?)
+                         ON CONFLICT(user_id) DO UPDATE SET
+                           pending_image_path=excluded.pending_image_path,
+                           updated_at=excluded.updated_at""", (int(user_id), str(path), now()))
+
+    def intake_take_pending_image(self, user_id):
+        with self.c() as x:
+            r = x.execute('SELECT pending_image_path FROM intake_sessions WHERE user_id=?', (int(user_id),)).fetchone()
+            path = str(r[0] or '') if r else ''
+            if r:
+                x.execute('UPDATE intake_sessions SET pending_image_path='',updated_at=? WHERE user_id=?', (now(), int(user_id)))
+            return path
+
+    def intake_has_fingerprint(self, user_id, fingerprint):
+        with self.c() as x:
+            return x.execute('SELECT 1 FROM intake_items WHERE user_id=? AND fingerprint=?', (int(user_id), str(fingerprint))).fetchone() is not None
+
+    def intake_add(self, user_id, q):
+        with self.c() as x:
+            x.execute("""INSERT OR IGNORE INTO intake_items
+                (user_id,fingerprint,message_id,question,options_json,correct_index,explanation,answer_source,voted_now,image_path,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (int(user_id), q['fingerprint'], int(q['message_id']), q['question'],
+                 json.dumps(q['options'], ensure_ascii=False), int(q['correct_index']),
+                 q.get('explanation',''), q.get('answer_source','telegram_poll_results'),
+                 int(bool(q.get('voted_now'))), q.get('image_path',''), now()))
+
+    def intake_items(self, user_id):
+        with self.c() as x:
+            rows = x.execute('SELECT * FROM intake_items WHERE user_id=? ORDER BY id', (int(user_id),)).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d['options'] = json.loads(d.get('options_json') or '[]')
+                except Exception:
+                    d['options'] = []
+                out.append(d)
+            return out
+
+    def intake_stats(self, user_id):
+        with self.c() as x:
+            r = x.execute("""SELECT
+                count(*) AS count,
+                sum(CASE WHEN image_path IS NOT NULL AND image_path <> '' THEN 1 ELSE 0 END) AS with_image
+                FROM intake_items WHERE user_id=?""", (int(user_id),)).fetchone()
+            pending = x.execute('SELECT pending_image_path FROM intake_sessions WHERE user_id=?', (int(user_id),)).fetchone()
+            count = int(r['count'] or 0)
+            with_image = int(r['with_image'] or 0)
+            return {'count': count, 'with_image': with_image, 'without_image': count-with_image,
+                    'pending_image': str(pending[0] or '') if pending else ''}
+
+    def intake_clear(self, user_id):
+        with self.c() as x:
+            x.execute('DELETE FROM intake_items WHERE user_id=?', (int(user_id),))
+            x.execute('DELETE FROM intake_sessions WHERE user_id=?', (int(user_id),))
 
     def count(self, table):
         allowed = {'quizzes', 'fingerprints', 'orders', 'sources'}
