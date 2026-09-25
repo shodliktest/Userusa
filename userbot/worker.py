@@ -8,6 +8,7 @@ from config.settings import load_settings
 from storage.database import Database
 from ai.operator import Operator
 from userbot.scanner import scan
+from userbot.intake import IntakeManager
 
 
 class Worker:
@@ -23,6 +24,7 @@ class Worker:
         self.stop_event = threading.Event()
         self.stats = {'status': 'stopped', 'source': '', 'checked': 0, 'found': 0, 'skipped': 0, 'published': 0, 'files_sent': 0, 'error': ''}
         self.hist = {}
+        self.intake = IntakeManager(self.db)
         self.lock = threading.RLock()
 
     def start(self):
@@ -63,17 +65,23 @@ class Worker:
         async def incoming(e):
             if not e.is_private:
                 return
-            text = (e.raw_text or '').strip()
-            if not text:
-                return
             try:
+                # Intake has priority: INFO/YAKUNLASH, photos and Telegram quizzes
+                # are consumed here. Anything else falls through to the normal operator.
+                consumed = await self.intake.handle(self.client, e)
+                if consumed:
+                    return
+
+                text = (e.raw_text or '').strip()
+                if not text:
+                    return
                 history = self.hist.setdefault(str(e.sender_id), [])
                 answer = op.reply(history, text)
                 history.extend([{'role': 'user', 'content': text}, {'role': 'assistant', 'content': answer}])
                 del history[:-14]
                 await e.reply(answer)
             except Exception as exc:
-                self.db.log('ERROR', f'Operator: {exc}')
+                self.db.log('ERROR', f'Incoming handler: {exc}')
 
         await self.client.run_until_disconnected()
 
