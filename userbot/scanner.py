@@ -53,11 +53,19 @@ def fingerprint(q, options):
 
 
 def poll_from_message(msg):
-    media = getattr(msg, 'media', None)
-    poll = getattr(media, 'poll', None) if media else None
-    if poll is None:
-        poll = getattr(msg, 'poll', None)
-    return poll
+    # Telethon normally exposes polls as MessageMediaPoll.poll. Keep several
+    # fallbacks because forwarded/shared polls can arrive with different TL wrappers.
+    for obj in (msg, getattr(msg, 'media', None)):
+        if obj is None:
+            continue
+        poll = getattr(obj, 'poll', None)
+        if poll is not None:
+            return poll
+        media = getattr(obj, 'media', None)
+        poll = getattr(media, 'poll', None) if media is not None else None
+        if poll is not None:
+            return poll
+    return None
 
 
 def pdata(msg):
@@ -263,20 +271,29 @@ async def _send_docx_batch(client, output_chat, records):
     return sent
 
 
-async def scan(client, db, src, target, stop_event, settings, stats, output_chat='', publish_enabled=False, file_publish_enabled=True, per_file=20):
+async def scan(client, db, src, target, stop_event, settings, stats, output_chat='', publish_enabled=False, file_publish_enabled=True, per_file=20, scan_mode='target'):
     found = checked = skipped = published = files_sent = 0
     batch_records = []
     state = db.state(src)
     stats.update(status='starting', source=str(src), found=0, checked=0, skipped=0, published=0, files_sent=0, error='')
 
     try:
-        # Start from newest messages. We keep a checkpoint so a later run can skip
-        # already processed message IDs while still allowing new history to be seen.
-        async for msg in client.iter_messages(src, limit=None):
+        # Target mode keeps the existing newest-first behavior. Full-history mode
+        # walks from the oldest available message to the newest and resumes after
+        # the saved message_id checkpoint.
+        full_history = str(scan_mode or 'target').lower() in ('full', 'all', 'history')
+        state_last = int(state.get('last_message_id', 0) or 0)
+        if full_history:
+            iterator = client.iter_messages(src, limit=None, reverse=True, min_id=state_last)
+        else:
+            iterator = client.iter_messages(src, limit=None)
+        async for msg in iterator:
             if stop_event.is_set():
                 stats['status'] = 'stopping'
                 break
             if not getattr(msg, 'id', None):
+                continue
+            if full_history and int(msg.id) <= state_last:
                 continue
 
             checked += 1
@@ -346,7 +363,7 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
                           found=state.get('found', 0) + found)
             stats.update(found=found, checked=checked, skipped=skipped, published=published, files_sent=files_sent)
 
-            if target and found >= int(target):
+            if (not full_history) and target and found >= int(target):
                 break
             await asyncio.sleep(0.8)
 

@@ -111,6 +111,18 @@ class IntakeManager:
 
         data = _quiz_data(msg)
         if data is None:
+            # Telegram can deliver a forwarded/shared poll with a minimal message
+            # object first. Re-fetch the exact private-chat message once and inspect
+            # the canonical TL object before giving it to the normal operator.
+            try:
+                fresh = await client.get_messages(event.chat_id, ids=int(msg.id))
+                if fresh is not None:
+                    data = _quiz_data(fresh)
+                    if data is not None:
+                        msg = fresh
+            except Exception as exc:
+                self.db.log("WARN", f"Intake poll refresh uid={uid}, msg_id={msg.id}: {exc}")
+        if data is None:
             # Text other than INFO/YAKUNLASH belongs to the normal operator.
             return False
 
@@ -199,9 +211,10 @@ class IntakeManager:
         await event.reply(f"⏳ {len(rows)} ta viktorinadan Word fayl tayyorlanmoqda...")
         from utils.exporter import export
 
-        name = _safe_name(rows[0].get("question") or "quizlar")
+        # Use the exporter default name so the DOCX content starts immediately
+        # with the first image (when present), not with a generated title.
         try:
-            files = export(rows, max(1, len(rows)), name)
+            files = export(rows, max(1, len(rows)), 'quiz_test')
             for path in files:
                 await client.send_file(
                     event.chat_id,

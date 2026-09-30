@@ -119,6 +119,7 @@ class Worker:
                         publish_enabled=bool(row.get('publish_enabled', 0)),
                         file_publish_enabled=bool(row.get('file_publish_enabled', 1)),
                         per_file=int(row.get('per_file', 20) or 20),
+                        scan_mode=str(row.get('scan_mode') or 'target'),
                     )
                     self.db.log('INFO', f'Scan DONE: {source}; found={n}')
                 except Exception as exc:
