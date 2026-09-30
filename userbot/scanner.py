@@ -53,36 +53,80 @@ def fingerprint(q, options):
 
 
 def poll_from_message(msg):
-    # Telethon normally exposes polls as MessageMediaPoll.poll. Keep several
-    # fallbacks because forwarded/shared polls can arrive with different TL wrappers.
-    for obj in (msg, getattr(msg, 'media', None)):
-        if obj is None:
-            continue
+    """Return the real TL Poll from normal, forwarded and shared messages.
+
+    Telethon normally exposes it as Message.media.poll, but forwarded/shared
+    messages can be wrapped more deeply. We deliberately unwrap only known
+    poll-bearing TL fields and never treat arbitrary message text as a poll.
+    """
+    if msg is None:
+        return None
+
+    seen = set()
+
+    def walk(obj, depth=0):
+        if obj is None or depth > 5:
+            return None
+        oid = id(obj)
+        if oid in seen:
+            return None
+        seen.add(oid)
+
+        # The actual Telegram Poll constructor.
+        if isinstance(obj, types.Poll):
+            return obj
+
+        # Standard Message -> MessageMediaPoll -> Poll.
         poll = getattr(obj, 'poll', None)
-        if poll is not None:
+        if isinstance(poll, types.Poll):
             return poll
-        media = getattr(obj, 'media', None)
-        poll = getattr(media, 'poll', None) if media is not None else None
-        if poll is not None:
-            return poll
-    return None
+
+        # Unwrap common TL containers used by MessageMediaPoll / forwarded data.
+        for attr in ('media', 'message', 'reply_to', 'fwd_from'):
+            child = getattr(obj, attr, None)
+            if child is not None:
+                found = walk(child, depth + 1)
+                if found is not None:
+                    return found
+
+        # Some Telethon containers expose nested lists.
+        if isinstance(obj, (list, tuple)):
+            for child in obj:
+                found = walk(child, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    return walk(msg)
 
 
-def pdata(msg):
+def pdata(msg, anonymous_only=True):
     poll = poll_from_message(msg)
-    # User's sources contain Telegram's anonymous quiz/viktorina polls.
-    # In MTProto: quiz=True + public_voters flag absent/False = anonymous quiz.
-    # Do not collect non-anonymous quizzes here.
     if poll is None or not bool(getattr(poll, 'quiz', False)):
         return None
-    if bool(getattr(poll, 'public_voters', False)):
+
+    # Anonymous Telegram quiz = public_voters flag is absent/False.
+    if anonymous_only and bool(getattr(poll, 'public_voters', False)):
         return None
+
     q = clean(getattr(poll, 'question', None))
     answers = list(getattr(poll, 'answers', None) or [])
     options = [clean(getattr(a, 'text', None)) for a in answers]
     if not q or len(options) < 2 or any(not x for x in options):
         return None
     return q, options, poll, answers
+
+
+def poll_kind(msg):
+    """Diagnostic classification used by scanner logs."""
+    poll = poll_from_message(msg)
+    if poll is None:
+        return 'none'
+    if not bool(getattr(poll, 'quiz', False)):
+        return 'regular_poll'
+    if bool(getattr(poll, 'public_voters', False)):
+        return 'nonanonymous_quiz'
+    return 'anonymous_quiz'
 
 
 def _walk_poll_results(obj, seen=None):
@@ -271,101 +315,150 @@ async def _send_docx_batch(client, output_chat, records):
     return sent
 
 
-async def scan(client, db, src, target, stop_event, settings, stats, output_chat='', publish_enabled=False, file_publish_enabled=True, per_file=20, scan_mode='target'):
+async def scan(client, db, src, target, stop_event, settings, stats, output_chat='',
+               publish_enabled=False, file_publish_enabled=True, per_file=20,
+               scan_mode='target'):
     found = checked = skipped = published = files_sent = 0
+    polls_seen = anonymous_quizzes = answer_failures = duplicate_count = 0
     batch_records = []
     state = db.state(src)
-    stats.update(status='starting', source=str(src), found=0, checked=0, skipped=0, published=0, files_sent=0, error='')
+
+    full_history = str(scan_mode or 'target').lower() in ('full', 'all', 'history')
+    state_last = int(state.get('last_message_id', 0) or 0)
+    mode_name = 'FULL_HISTORY' if full_history else 'TARGET'
+    stats.update(status='starting', source=str(src), found=0, checked=0, skipped=0,
+                 published=0, files_sent=0, polls_seen=0, anonymous_quizzes=0,
+                 answer_failures=0, duplicates=0, error='')
+    db.log('INFO', f'Scan MODE={mode_name}: {src}; target={target}; checkpoint={state_last}')
 
     try:
-        # Target mode keeps the existing newest-first behavior. Full-history mode
-        # walks from the oldest available message to the newest and resumes after
-        # the saved message_id checkpoint.
-        full_history = str(scan_mode or 'target').lower() in ('full', 'all', 'history')
-        state_last = int(state.get('last_message_id', 0) or 0)
+        # Telethon documents reverse=True as oldest -> newest. When resuming a
+        # full-history scan, min_id excludes everything already checkpointed.
         if full_history:
-            iterator = client.iter_messages(src, limit=None, reverse=True, min_id=state_last)
+            if state_last > 0:
+                iterator = client.iter_messages(src, limit=None, reverse=True, min_id=state_last)
+            else:
+                iterator = client.iter_messages(src, limit=None, reverse=True)
         else:
             iterator = client.iter_messages(src, limit=None)
+
+        checkpoint_every = 25
+        since_checkpoint = 0
+        last_seen_id = state_last
+
         async for msg in iterator:
             if stop_event.is_set():
                 stats['status'] = 'stopping'
                 break
-            if not getattr(msg, 'id', None):
+            mid = int(getattr(msg, 'id', 0) or 0)
+            if mid <= 0:
                 continue
-            if full_history and int(msg.id) <= state_last:
+            if full_history and state_last and mid <= state_last:
                 continue
 
             checked += 1
-            stats.update(status='scanning', source=str(src), found=found, checked=checked,
-                         skipped=skipped, published=published, files_sent=files_sent)
+            last_seen_id = mid
+            since_checkpoint += 1
 
-            data = pdata(msg)
+            kind = poll_kind(msg)
+            if kind != 'none':
+                polls_seen += 1
+            if kind == 'anonymous_quiz':
+                anonymous_quizzes += 1
+
+            stats.update(status='scanning', source=str(src), found=found, checked=checked,
+                         skipped=skipped, published=published, files_sent=files_sent,
+                         polls_seen=polls_seen, anonymous_quizzes=anonymous_quizzes,
+                         answer_failures=answer_failures, duplicates=duplicate_count)
+
+            data = pdata(msg, anonymous_only=True)
             if not data:
+                # Persist progress in full-history mode even across non-quiz runs.
+                if full_history and since_checkpoint >= checkpoint_every:
+                    db.save_state(src, last_message_id=last_seen_id)
+                    since_checkpoint = 0
                 continue
+
             q, options, poll, answers = data
             fp = fingerprint(q, options)
             if db.fp(fp):
                 skipped += 1
-                continue
-
-            try:
-                correct, solution, voted_now = await telegram_correct_index(
-                    client, src, msg, poll, answers
-                )
-            except errors.RPCError as exc:
-                skipped += 1
-                db.log('WARN', f'Vote failed: {type(exc).__name__}: {exc}; msg_id={msg.id}; {q[:100]}')
-                continue
-
-            if correct is None:
-                skipped += 1
-                db.log('WARN', f'Telegram correct answer not exposed; msg_id={msg.id}; {q[:100]}')
-                continue
-
-            record = {
-                'fingerprint': fp,
-                'source': str(src),
-                'message_id': int(msg.id),
-                'question': q,
-                'options': options,
-                'correct_index': int(correct),
-                'confidence': 1.0,
-                'explanation': clean(solution),
-                'answer_source': 'telegram_poll_results',
-                'voted_now': bool(voted_now),
-            }
-            db.savefp(fp, src, msg.id)
-            db.save(record)
-            found += 1
-            batch_records.append(record)
-
-            if publish_enabled and output_chat:
+                duplicate_count += 1
+                db.log('INFO', f'SKIP duplicate fingerprint: {src}:{mid}; {q[:80]}')
+            else:
                 try:
-                    from userbot.publisher import publish_quiz
-                    await publish_quiz(client, output_chat, q, options, int(correct), clean(solution))
-                    published += 1
-                    db.log('INFO', f'Published quiz to {output_chat}: {q[:80]}')
+                    correct, solution, voted_now = await telegram_correct_index(
+                        client, src, msg, poll, answers
+                    )
+                except errors.RPCError as exc:
+                    skipped += 1
+                    answer_failures += 1
+                    db.log('WARN', f'Answer RPC failed: {type(exc).__name__}: {exc}; msg_id={mid}; {q[:100]}')
+                    correct = None
                 except Exception as exc:
-                    db.log('ERROR', f'Publish failed for {q[:80]}: {exc}')
+                    skipped += 1
+                    answer_failures += 1
+                    db.log('WARN', f'Answer extraction failed: {type(exc).__name__}: {exc}; msg_id={mid}; {q[:100]}')
+                    correct = None
 
-            if file_publish_enabled and output_chat and len(batch_records) >= max(1, int(per_file)):
-                try:
-                    sent = await _send_docx_batch(client, output_chat, batch_records)
-                    files_sent += int(sent or 0)
-                    db.log('INFO', f'DOCX yuborildi: {output_chat}; {len(batch_records)} quiz; files={sent or 0}')
-                    batch_records.clear()
-                except Exception as exc:
-                    db.log('ERROR', f'DOCX yuborish xatosi {output_chat}: {exc}')
+                if correct is not None:
+                    record = {
+                        'fingerprint': fp,
+                        'source': str(src),
+                        'message_id': mid,
+                        'question': q,
+                        'options': options,
+                        'correct_index': int(correct),
+                        'confidence': 1.0,
+                        'explanation': clean(solution),
+                        'answer_source': 'telegram_poll_results',
+                        'voted_now': bool(voted_now),
+                    }
+                    db.savefp(fp, src, mid)
+                    db.save(record)
+                    found += 1
+                    batch_records.append(record)
+                    db.log('INFO', f'QUIZ OK {src}:{mid}: {q[:100]}')
 
-            db.save_state(src, last_message_id=msg.id,
-                          checked=state.get('checked', 0) + checked,
-                          found=state.get('found', 0) + found)
-            stats.update(found=found, checked=checked, skipped=skipped, published=published, files_sent=files_sent)
+                    if publish_enabled and output_chat:
+                        try:
+                            from userbot.publisher import publish_quiz
+                            await publish_quiz(client, output_chat, q, options, int(correct), clean(solution))
+                            published += 1
+                        except Exception as exc:
+                            db.log('ERROR', f'Publish failed for {q[:80]}: {type(exc).__name__}: {exc}')
+
+                    if file_publish_enabled and output_chat and len(batch_records) >= max(1, int(per_file)):
+                        try:
+                            sent = await _send_docx_batch(client, output_chat, batch_records)
+                            files_sent += int(sent or 0)
+                            db.log('INFO', f'DOCX yuborildi: {output_chat}; {len(batch_records)} quiz; files={sent or 0}')
+                            batch_records.clear()
+                        except Exception as exc:
+                            db.log('ERROR', f'DOCX yuborish xatosi {output_chat}: {type(exc).__name__}: {exc}')
+
+            # Checkpoint every N messages, and always on every successful quiz.
+            if full_history and (since_checkpoint >= checkpoint_every or correct is not None):
+                db.save_state(src, last_message_id=last_seen_id,
+                              checked=state.get('checked', 0) + checked,
+                              found=state.get('found', 0) + found)
+                since_checkpoint = 0
+
+            stats.update(found=found, checked=checked, skipped=skipped,
+                         published=published, files_sent=files_sent,
+                         polls_seen=polls_seen, anonymous_quizzes=anonymous_quizzes,
+                         answer_failures=answer_failures, duplicates=duplicate_count)
 
             if (not full_history) and target and found >= int(target):
+                db.log('INFO', f'Target reached: {found}/{target}')
                 break
-            await asyncio.sleep(0.8)
+
+            await asyncio.sleep(0.35)
+
+        if full_history and last_seen_id > 0:
+            db.save_state(src, last_message_id=last_seen_id,
+                          checked=state.get('checked', 0) + checked,
+                          found=state.get('found', 0) + found)
 
         if batch_records and file_publish_enabled and output_chat:
             try:
@@ -374,7 +467,9 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
                 db.log('INFO', f'DOCX yuborildi: {output_chat}; {len(batch_records)} quiz; files={sent or 0}')
                 batch_records.clear()
             except Exception as exc:
-                db.log('ERROR', f'DOCX yuborish xatosi {output_chat}: {exc}')
+                db.log('ERROR', f'DOCX yuborish xatosi {output_chat}: {type(exc).__name__}: {exc}')
+
+        db.log('INFO', f'SCAN SUMMARY {src}: checked={checked}, polls={polls_seen}, anonymous_quizzes={anonymous_quizzes}, found={found}, duplicates={duplicate_count}, answer_failures={answer_failures}')
 
     except errors.FloodWaitError as exc:
         wait = int(getattr(exc, 'seconds', 0))
@@ -382,12 +477,16 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
         db.log('WARN', f'Telegram FloodWait: {wait}s for {src}')
     except Exception as exc:
         stats.update(status='error', error=str(exc))
-        db.log('ERROR', f'Scanner {src}: {exc}')
+        db.log('ERROR', f'Scanner {src}: {type(exc).__name__}: {exc}')
         raise
     finally:
         if stop_event.is_set() and stats.get('status') != 'error':
             stats['status'] = 'stopped'
         elif stats.get('status') not in ('error', 'flood_wait'):
             stats['status'] = 'completed'
-        stats.update(found=found, checked=checked, skipped=skipped, published=published, files_sent=files_sent)
+        stats.update(found=found, checked=checked, skipped=skipped, published=published,
+                     files_sent=files_sent, polls_seen=polls_seen,
+                     anonymous_quizzes=anonymous_quizzes, answer_failures=answer_failures,
+                     duplicates=duplicate_count)
     return found
+
