@@ -43,6 +43,7 @@ with t[1]:
     target = c1.number_input('Manbadan nechta quiz?', min_value=1, max_value=100000, value=100)
     pf = c2.number_input('Har DOCX faylda nechta?', min_value=1, max_value=1000, value=20)
     out = c3.text_input('Quiz yuboriladigan kanal/guruh (ixtiyoriy)', placeholder='@mening_kanalim')
+    scan_mode = st.radio('Skanerlash rejimi', ['Belgilangan miqdor', 'Boshidan oxirigacha'], horizontal=True, help='Boshidan oxirigacha rejimida manbaning eng eski xabaridan eng yangisigacha barcha tarix tekshiriladi va checkpoint orqali davom ettiriladi.')
     c4, c5 = st.columns(2)
     publish = c4.checkbox('Native Telegram Quiz sifatida yuborish', value=False)
     file_publish = c5.checkbox('DOCX fayllarni belgilangan guruh/kanalga yuborish', value=True)
@@ -51,14 +52,15 @@ with t[1]:
         if not src.strip():
             st.warning('Avval kanal/guruhni kiriting.')
         else:
-            db.add_source(src.strip(), target, pf, out.strip(), publish, file_publish)
+            db.add_source(src.strip(), target, pf, out.strip(), publish, file_publish, 'full' if scan_mode == 'Boshidan oxirigacha' else 'target')
             st.success('Manba saqlandi. Endi Scanner-ni boshlashingiz mumkin.')
 
     rows = db.sources()
     if rows:
         display_rows = [{
             'Manba': r['source'], 'Yoqilgan': bool(r.get('enabled', 1)),
-            'Maqsad': r['target_count'], 'TXT': r['per_file'],
+            'Rejim': 'Boshidan oxirigacha' if str(r.get('scan_mode') or 'target') == 'full' else 'Belgilangan miqdor',
+            'Maqsad': r['target_count'], 'DOCX': r['per_file'],
             'Output': r.get('output_chat', ''),
             'DOCX yuborish': bool(r.get('file_publish_enabled', 1)),
             'Native Quiz': bool(r.get('publish_enabled', 0))
@@ -99,13 +101,13 @@ with t[2]:
     srcf = st.text_input('Manba filter (ixtiyoriy)')
     n = st.number_input('Har faylda testlar', 1, 1000, 20)
     name = st.text_input('Fayl nomi/mavzu', 'quiz_test')
-    if st.button('📄 TXT tayyorlash'):
+    if st.button('📄 DOCX tayyorlash'):
         qs = db.quizzes(srcf.strip() or None)
         if not qs:
             st.warning('Export qilish uchun hali saqlangan quiz yo‘q. Avval Scanner orqali quizlarni yig‘ing.')
         else:
             for p in export(qs, n, name):
-                st.download_button('⬇️ ' + p.name, p.read_bytes(), file_name=p.name, mime='text/plain', key='dl_' + p.name)
+                st.download_button('⬇️ ' + p.name, p.read_bytes(), file_name=p.name, mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document', key='dl_' + p.name)
 
 with t[3]:
     for label, tbl in [('Quizlar', 'quizzes'), ('Fingerprintlar', 'fingerprints'), ('Buyurtmalar', 'orders')]:

@@ -1,69 +1,48 @@
-# Telegram Quiz UserBot PRO
+# Telegram Quiz UserBot Pro — Full
 
-Streamlit + Telethon asosidagi alohida Telegram UserBot loyihasi.
+## Imkoniyatlar
+- Streamlit boshqaruv paneli
+- Telethon UserBot
+- Groq operator (10 tagacha key)
+- Anonim Telegram quiz/viktorinalarni kanal/guruhdan olish
+- Telegram `pollResults` orqali correct answer; AI quiz javobini topmaydi
+- Belgilangan miqdorda yoki kanal/guruh tarixini boshidan oxirigacha skanerlash
+- Scanner fingerprint orqali takroriy quizlarni o'tkazib yuborish
+- Private chat: rasm -> viktorina yoki rasmsiz viktorina qabul qilish
+- INFO va YAKUNLASH
+- Rasmni savoldan oldin DOCX ga joylash
+- Native Telegram Quiz sifatida publish qilish
+- DOCX ni belgilangan kanal/guruhga yuborish
+- UTF-8/mojibake tuzatish va reklama URL/@username larini tozalash
 
-## Asosiy arxitektura
+## Secrets
+`.streamlit/secrets.toml`:
 
-- Background Telethon UserBot
-- Private-message operator (Groq ishlatadi)
-- Kanal/guruh scanner
-- Native Telegram **Quiz** poll aniqlash
-- Har bir quiz uchun original `source` va Telegram `message_id` saqlash
-- **Correct answer AI bilan yechilmaydi**
-- Scanner `messages.sendVote` orqali shu quizga bir marta ovoz beradi
-- Telegram qaytargan `pollResults` ichidagi `correct=True` flagdan to‘g‘ri variant olinadi
-- Agar akkaunt allaqachon ovoz bergan bo‘lsa va `REVOTE_NOT_ALLOWED` qaytsa, bot qayta ovoz bermaydi; `messages.getPollResults` orqali natijani oladi
-- Telegram `solution` mavjud bo‘lsa `Izoh:` sifatida saqlanadi; AI izoh yozmaydi
-- Fingerprint/dedup
-- URL, `t.me`, `telegram.me`, `@username` reklama qismlarini tozalash
-- UTF-8 mojibake recovery (`â€˜`, `â€™`, `â€‘` kabi buzilishlar)
-- Telethon `TextWithEntities` va ichma-ich text obyektlarini oddiy stringga aylantirish
-- TXT export: `1. Savol`, `A)`, `*B)`, `Izoh:` faqat mavjud bo‘lsa
-- Optional native Quiz publisher
-- SQLite persistence
-- Scanner start/stop state va FloodWait logging
-
-## Correct-answer oqimi
-
-```text
-Telegram Quiz message
-        ↓
-source + message_id + poll.answers
-        ↓
-messages.sendVote(1 ta option)
-        ↓
-Telegram pollResults
-        ↓
-PollAnswerVoters.correct=True
-        ↓
-A/B/C/D index
-        ↓
-SQLite
-        ↓
-TXT / optional publisher
+```toml
+TELEGRAM_API_ID = 123456
+TELEGRAM_API_HASH = "..."
+TELEGRAM_PHONE = "+998..."
+TELEGRAM_SESSION_STRING = "..."
+GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_API_KEY = "..."
+GROQ_API_KEY1 = "..."
+GROQ_API_KEY2 = "..."
 ```
 
-Bu scanner savolni Groq yordamida taxmin qilmaydi. Telegram `correct` flag qaytarmasa, quiz **verified sifatida saqlanmaydi**.
+`GROQ_API_KEY` dan `GROQ_API_KEY9` gacha qo'llab-quvvatlanadi.
 
-## Groq
+## Private chat
+1. Rasm yuboring.
+2. Uning ostidagi Telegram quizni yuboring.
+3. Bot quizni Telegramning o'zidan tekshiradi va qabul qiladi.
+4. Istalgancha quiz yuborish mumkin.
+5. `INFO` — yig'im holati.
+6. `YAKUNLASH` — barcha yig'ilgan quizlarni bitta DOCX qilib shu chatga qaytaradi.
 
-`GROQ_API_KEY` va `GROQ_API_KEY1` ... `GROQ_API_KEY9` pooli faqat operatorning suhbat javoblari uchun ishlatiladi. 429 bo‘lsa pool keyni almashtiradi. Bu Telegram limitlarini chetlab o‘tish mexanizmi emas.
+Scanner avval olgan quizni user private chat orqali yuborsa ham private intake uni qabul qiladi; scanner fingerprinti private intake'ni bloklamaydi.
 
-## Telegram cheklovlari
-
-Scanner `messages.sendVote`ni faqat bir marta yuboradi. `REVOTE_NOT_ALLOWED` holatida qayta ovoz berishga urinmaydi. Kanalga a’zo bo‘lish, subscriber-only poll, country restriction yoki yopilgan poll kabi Telegram cheklovlari bajarilmasa, quiz skip qilinadi va sabab logga yoziladi.
-
-## TXT
-
-Misol:
-
-```text
-1. Qaysi gapda imloviy xatolik uchramaydi?
-A) O‘sha vaqtlarda...
-B) Chap tomonda...
-*C) Qizning yuragi...
-D) Bog‘ga kirdim...
-Izoh: Telegram quiz solution bo‘lsa shu yerda chiqadi.
+## Ishga tushirish
+```bash
+pip install -r requirements.txt
+streamlit run app.py
 ```
-
-`TextWithEntities(...)` repri TXTga yozilmaydi. Fayl UTF-8 encodingda yaratiladi.
