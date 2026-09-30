@@ -87,15 +87,17 @@ with t[1]:
     st.write('**Scanner holati:**', labels.get(status, status))
     if w.stats.get('source'):
         st.write('**Manba:**', w.stats['source'])
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
     m1.metric('Tekshirilgan', w.stats.get('checked', 0))
     m2.metric('Topilgan', w.stats.get('found', 0))
     m3.metric('O‘tkazib yuborilgan', w.stats.get('skipped', 0))
     m4.metric('Native yuborilgan', w.stats.get('published', 0))
     m5.metric('DOCX yuborilgan', w.stats.get('files_sent', 0))
+    m6.metric('Anonim quiz', w.stats.get('anonymous_quizzes', 0))
+    m7.metric('Javob xatosi', w.stats.get('answer_failures', 0))
     if w.stats.get('error'):
         st.error(w.stats['error'])
-    st.caption('Statusni yangilash uchun “🔄 HOLATNI YANGILASH” tugmasini bosing. Quiz javobi Telegram pollResults orqali olinadi.')
+    st.caption('Statusni yangilash uchun “🔄 HOLATNI YANGILASH” tugmasini bosing. Quiz javobi Telegram pollResults orqali olinadi. Logda poll/quiz/javob xatolari alohida ko‘rsatiladi.')
 
 with t[2]:
     srcf = st.text_input('Manba filter (ixtiyoriy)')
