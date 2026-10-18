@@ -1,5 +1,7 @@
 import json
+import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -14,10 +16,19 @@ class Database:
         self.p = p
         self.init()
 
+    @contextmanager
     def c(self):
+        """Connection that commits on success and ALWAYS closes (no leaked handles)."""
         x = sqlite3.connect(self.p, timeout=30)
         x.row_factory = sqlite3.Row
-        return x
+        try:
+            yield x
+            x.commit()
+        except BaseException:
+            x.rollback()
+            raise
+        finally:
+            x.close()
 
     def init(self):
         with self.c() as x:
@@ -52,6 +63,7 @@ class Database:
                 explanation TEXT,
                 answer_source TEXT DEFAULT '',
                 voted_now INTEGER DEFAULT 0,
+                image_path TEXT DEFAULT '',
                 raw_json TEXT,
                 created_at TEXT
             );
@@ -63,6 +75,13 @@ class Database:
                 user_id INTEGER PRIMARY KEY,
                 pending_image_path TEXT DEFAULT '',
                 updated_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS intake_pending_images(
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                image_path TEXT NOT NULL,
+                created_at TEXT
             );
             CREATE TABLE IF NOT EXISTS intake_items(
                 id INTEGER PRIMARY KEY,
@@ -94,6 +113,8 @@ class Database:
                 x.execute("ALTER TABLE quizzes ADD COLUMN answer_source TEXT DEFAULT ''")
             if 'voted_now' not in {r[1] for r in x.execute('PRAGMA table_info(quizzes)')}:
                 x.execute("ALTER TABLE quizzes ADD COLUMN voted_now INTEGER DEFAULT 0")
+            if 'image_path' not in {r[1] for r in x.execute('PRAGMA table_info(quizzes)')}:
+                x.execute("ALTER TABLE quizzes ADD COLUMN image_path TEXT DEFAULT ''")
 
     def sources(self):
         with self.c() as x:
@@ -129,11 +150,11 @@ class Database:
     def save(self, q):
         with self.c() as x:
             x.execute('''INSERT OR IGNORE INTO quizzes
-                (fingerprint,source,message_id,question,options_json,correct_index,confidence,explanation,answer_source,voted_now,raw_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (fingerprint,source,message_id,question,options_json,correct_index,confidence,explanation,answer_source,voted_now,image_path,raw_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                       (q['fingerprint'], q['source'], q['message_id'], q['question'],
                        json.dumps(q['options'], ensure_ascii=False), q['correct_index'],
-                       q['confidence'], q.get('explanation', ''), q.get('answer_source', ''), int(bool(q.get('voted_now'))), json.dumps(q, ensure_ascii=False), now()))
+                       q['confidence'], q.get('explanation', ''), q.get('answer_source', ''), int(bool(q.get('voted_now'))), q.get('image_path', '') or '', json.dumps(q, ensure_ascii=False), now()))
 
     def quizzes(self, source=None):
         with self.c() as x:
@@ -165,8 +186,15 @@ class Database:
                        now()))
 
     def log(self, level, message):
+        stamp = now()
         with self.c() as x:
-            x.execute('INSERT INTO logs(level,message,created_at) VALUES(?,?,?)', (level, str(message), now()))
+            x.execute('INSERT INTO logs(level,message,created_at) VALUES(?,?,?)', (level, str(message), stamp))
+        # Console (terminal / Streamlit Cloud "Manage app" logs). Disable: LOG_TO_CONSOLE=0
+        if os.getenv('LOG_TO_CONSOLE', '1') != '0':
+            try:
+                print(f'[{stamp}] {level}: {message}', flush=True)
+            except Exception:
+                pass
 
     def logs(self):
         with self.c() as x:
@@ -185,20 +213,78 @@ class Database:
 
 
     # --- Private user intake: photo -> quiz pairs -------------------------
-    def intake_set_pending_image(self, user_id, path):
+    def intake_set_pending_image(self, user_id, path, message_id=0):
+        """Backward-compatible single pending image API; now backed by FIFO queue."""
+        self.intake_add_pending_image(user_id, message_id, path)
+
+    def intake_add_pending_image(self, user_id, message_id, path):
         with self.c() as x:
-            x.execute("""INSERT INTO intake_sessions(user_id,pending_image_path,updated_at)
-                         VALUES(?,?,?)
-                         ON CONFLICT(user_id) DO UPDATE SET
-                           pending_image_path=excluded.pending_image_path,
-                           updated_at=excluded.updated_at""", (int(user_id), str(path), now()))
+            x.execute(
+                "INSERT INTO intake_pending_images(user_id,message_id,image_path,created_at) VALUES(?,?,?,?)",
+                (int(user_id), int(message_id or 0), str(path), now()),
+            )
+            x.execute(
+                """INSERT INTO intake_sessions(user_id,pending_image_path,updated_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                     pending_image_path=excluded.pending_image_path,
+                     updated_at=excluded.updated_at""",
+                (int(user_id), str(path), now()),
+            )
 
     def intake_take_pending_image(self, user_id):
+        """Pop the oldest pending image (FIFO) and keep legacy API semantics."""
         with self.c() as x:
-            r = x.execute('SELECT pending_image_path FROM intake_sessions WHERE user_id=?', (int(user_id),)).fetchone()
-            path = str(r[0] or '') if r else ''
-            if r:
-                x.execute('UPDATE intake_sessions SET pending_image_path='',updated_at=? WHERE user_id=?', (now(), int(user_id)))
+            r = x.execute(
+                'SELECT id,image_path FROM intake_pending_images WHERE user_id=? ORDER BY id LIMIT 1',
+                (int(user_id),),
+            ).fetchone()
+            if not r:
+                # Legacy row may exist from an older version.
+                legacy = x.execute(
+                    'SELECT pending_image_path FROM intake_sessions WHERE user_id=?',
+                    (int(user_id),),
+                ).fetchone()
+                path = str(legacy[0] or '') if legacy else ''
+                if legacy:
+                    x.execute('UPDATE intake_sessions SET pending_image_path="",updated_at=? WHERE user_id=?', (now(), int(user_id)))
+                return path
+
+            path = str(r['image_path'] or '')
+            x.execute('DELETE FROM intake_pending_images WHERE id=?', (int(r['id']),))
+            nxt = x.execute(
+                'SELECT image_path FROM intake_pending_images WHERE user_id=? ORDER BY id LIMIT 1',
+                (int(user_id),),
+            ).fetchone()
+            x.execute(
+                'UPDATE intake_sessions SET pending_image_path=?,updated_at=? WHERE user_id=?',
+                (str(nxt[0] or '') if nxt else '', now(), int(user_id)),
+            )
+            return path
+
+    def intake_pending_count(self, user_id):
+        with self.c() as x:
+            return int(x.execute('SELECT count(*) FROM intake_pending_images WHERE user_id=?', (int(user_id),)).fetchone()[0])
+
+    def intake_take_pending_image_for_message(self, user_id, message_id):
+        """Pop a queued image only if its Telegram message_id matches exactly."""
+        with self.c() as x:
+            r = x.execute(
+                'SELECT id,image_path FROM intake_pending_images WHERE user_id=? AND message_id=? ORDER BY id LIMIT 1',
+                (int(user_id), int(message_id)),
+            ).fetchone()
+            if not r:
+                return ''
+            path = str(r['image_path'] or '')
+            x.execute('DELETE FROM intake_pending_images WHERE id=?', (int(r['id']),))
+            nxt = x.execute(
+                'SELECT image_path FROM intake_pending_images WHERE user_id=? ORDER BY id LIMIT 1',
+                (int(user_id),),
+            ).fetchone()
+            x.execute(
+                'UPDATE intake_sessions SET pending_image_path=?,updated_at=? WHERE user_id=?',
+                (str(nxt[0] or '') if nxt else '', now(), int(user_id)),
+            )
             return path
 
     def intake_has_fingerprint(self, user_id, fingerprint):
@@ -234,16 +320,67 @@ class Database:
                 count(*) AS count,
                 sum(CASE WHEN image_path IS NOT NULL AND image_path <> '' THEN 1 ELSE 0 END) AS with_image
                 FROM intake_items WHERE user_id=?""", (int(user_id),)).fetchone()
-            pending = x.execute('SELECT pending_image_path FROM intake_sessions WHERE user_id=?', (int(user_id),)).fetchone()
+            pending = x.execute('SELECT image_path FROM intake_pending_images WHERE user_id=? ORDER BY id LIMIT 1', (int(user_id),)).fetchone()
+            pending_count = int(x.execute('SELECT count(*) FROM intake_pending_images WHERE user_id=?', (int(user_id),)).fetchone()[0])
             count = int(r['count'] or 0)
             with_image = int(r['with_image'] or 0)
             return {'count': count, 'with_image': with_image, 'without_image': count-with_image,
-                    'pending_image': str(pending[0] or '') if pending else ''}
+                    'pending_image': str(pending[0] or '') if pending else '',
+                    'pending_count': pending_count}
+
+    def intake_pending_paths(self, user_id):
+        with self.c() as x:
+            return [str(r[0] or '') for r in x.execute('SELECT image_path FROM intake_pending_images WHERE user_id=? ORDER BY id', (int(user_id),)).fetchall() if r[0]]
+
+    def intake_claim(self, user_id):
+        """Atomically take ALL collected items of a user and remove them from the DB.
+
+        Once claimed, a batch can never leak into the next collection, even if the
+        export/send step fails later (use intake_restore to put it back then).
+        """
+        with self.c() as x:
+            x.execute('BEGIN IMMEDIATE')
+            rows = x.execute('SELECT * FROM intake_items WHERE user_id=? ORDER BY id', (int(user_id),)).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d['options'] = json.loads(d.get('options_json') or '[]')
+                except Exception:
+                    d['options'] = []
+                out.append(d)
+            x.execute('DELETE FROM intake_items WHERE user_id=?', (int(user_id),))
+            return out
+
+    def intake_restore(self, user_id, rows):
+        for d in rows:
+            self.intake_add(user_id, d)
 
     def intake_clear(self, user_id):
         with self.c() as x:
             x.execute('DELETE FROM intake_items WHERE user_id=?', (int(user_id),))
+            x.execute('DELETE FROM intake_pending_images WHERE user_id=?', (int(user_id),))
             x.execute('DELETE FROM intake_sessions WHERE user_id=?', (int(user_id),))
+
+    # --- Persistence helpers (Telegram storage channel) --------------------
+    def has_state(self):
+        """True if the DB holds any real data (used to decide on restore)."""
+        with self.c() as x:
+            for t in ('sources', 'fingerprints', 'quizzes', 'scan_state', 'intake_items', 'intake_pending_images'):
+                if x.execute(f'SELECT 1 FROM {t} LIMIT 1').fetchone():
+                    return True
+        return False
+
+    def snapshot(self, dest):
+        """Consistent copy of the live database (sqlite online-backup API)."""
+        src = sqlite3.connect(self.p, timeout=30)
+        dst = sqlite3.connect(str(dest))
+        try:
+            src.backup(dst)
+            dst.commit()
+        finally:
+            dst.close()
+            src.close()
 
     def count(self, table):
         allowed = {'quizzes', 'fingerprints', 'orders', 'sources'}
