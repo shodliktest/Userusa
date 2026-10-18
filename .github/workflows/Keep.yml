@@ -1,4 +1,4 @@
-name: Quizmakerbot 
+name: Userbot
 
 on:
   schedule:
