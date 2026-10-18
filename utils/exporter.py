@@ -5,6 +5,7 @@ from typing import Any
 
 from docx import Document
 from docx.enum.text import WD_BREAK
+from docx.image.image import Image as DocxImage
 from docx.shared import Cm, Pt, RGBColor
 
 
@@ -79,7 +80,31 @@ def _add_option(doc: Document, letter: str, value: str, correct: bool) -> None:
         p.add_run('  ✓').bold = True
 
 
-def export(quizzes, n=20, name='quiz_test'):
+MAX_IMG_W_CM = 15.5
+MAX_IMG_H_CM = 11.0
+
+
+def _add_image(doc: Document, image_path: str) -> bool:
+    """Centered picture below the options, scaled to fit the page (never clipped)."""
+    try:
+        info = DocxImage.from_file(image_path)
+        px_w, px_h = max(1, info.px_width), max(1, info.px_height)
+        width_cm = min(MAX_IMG_W_CM, max(5.0, px_w / 96 * 2.54))
+        if width_cm * px_h / px_w > MAX_IMG_H_CM:
+            width_cm = MAX_IMG_H_CM * px_w / px_h
+        pic = doc.add_picture(image_path, width=Cm(width_cm))
+        if pic is not None and pic.paragraphs:
+            para = pic.paragraphs[0]
+            para.alignment = 1
+            para.paragraph_format.space_before = Pt(4)
+            para.paragraph_format.space_after = Pt(4)
+        return True
+    except Exception:
+        # A bad/missing image must not destroy the whole batch.
+        return False
+
+
+def export(quizzes, n=20, name='quiz_test', out_dir='exports'):
     """Export collected Telegram quiz records to DOCX files.
 
     Correct answers are taken only from the stored Telegram poll result
@@ -105,7 +130,11 @@ def export(quizzes, n=20, name='quiz_test'):
         section.left_margin = Cm(2.0)
         section.right_margin = Cm(2.0)
 
-        # For user-submitted image+quiz collections, the first content must be the image.
+        # Template (same for channel/group scans, private chat and QuizBot):
+        #   1. Question
+        #   A) option ... (correct one marked)
+        #   [image of that question, centered, below the options]
+        #   Izoh: ...
         # A short title is omitted when the generated name came from the first question.
         explicit_title = bool(name and name.strip() and name.strip().lower() != 'quiz_test')
         if explicit_title:
@@ -117,15 +146,6 @@ def export(quizzes, n=20, name='quiz_test'):
 
         for i, q in enumerate(batch, 1):
             image_path = text(q.get('image_path', ''))
-            if image_path and Path(image_path).is_file():
-                try:
-                    pic = doc.add_picture(image_path, width=Cm(15.5))
-                    if pic and pic.paragraphs:
-                        pic.paragraphs[0].alignment = 1
-                except Exception:
-                    # A bad/missing image must not destroy the whole batch.
-                    pass
-
             question = text(q.get('question', ''))
             qp = doc.add_paragraph()
             qp.paragraph_format.space_before = Pt(8)
@@ -141,6 +161,9 @@ def export(quizzes, n=20, name='quiz_test'):
                     break
                 _add_option(doc, chr(65 + j), option, j == correct)
 
+            if image_path and Path(image_path).is_file():
+                _add_image(doc, image_path)
+
             explanation = text(q.get('explanation', ''))
             if explanation:
                 ep = doc.add_paragraph()
@@ -151,7 +174,7 @@ def export(quizzes, n=20, name='quiz_test'):
             if i != len(batch):
                 doc.add_paragraph().add_run().add_break(WD_BREAK.LINE)
 
-        p = Path('exports') / f'{safe(base)}_{k // n + 1:02d}.docx'
+        p = Path(out_dir) / f'{safe(base)}_{k // n + 1:02d}.docx'
         p.parent.mkdir(parents=True, exist_ok=True)
         doc.save(p)
         out.append(p)
