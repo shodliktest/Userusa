@@ -1,13 +1,29 @@
 import asyncio
 import hashlib
 import json
+import mimetypes
 import re
+import shutil
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from telethon import errors, types
 from telethon.tl.functions.messages import GetPollResultsRequest, SendVoteRequest
 
-from utils.rate_limiter import GLOBAL_RATE_LIMITER, VOTE_RATE_LIMITER
+from utils.peers import resolve_peer
+from utils.rate_limiter import (
+    FLOOD_ERRORS,
+    GLOBAL_RATE_LIMITER,
+    HOOKS,
+    TRANSIENT_ERRORS,
+    VOTE_RATE_LIMITER,
+    Hooks,
+    StopRequested,
+    interruptible_sleep,
+    notify_hooks,
+)
 
 URL = re.compile(r'(?:https?://|t\.me/|telegram\.me/)[^\s]+|(?<!\w)@[A-Za-z0-9_]{3,}', re.I)
 
@@ -318,7 +334,10 @@ async def telegram_correct_index(client, src, msg, poll, answers):
         except errors.RPCError as exc:
             name = exc.__class__.__name__
             text = str(exc)
-            if name == 'RevoteNotAllowedError' or 'REVOTE_NOT_ALLOWED' in text:
+            if (name in ('RevoteNotAllowedError', 'MessagePollClosedError')
+                    or 'REVOTE_NOT_ALLOWED' in text or 'POLL_CLOSED' in text.upper()):
+                # Already voted, or the poll closed (timed quiz): a closed quiz
+                # exposes the correct option, so fall through to the refresh below.
                 already_voted = True
             elif name in ('FloodWaitError',):
                 raise
@@ -392,61 +411,120 @@ def _is_single_image_message(msg):
     return 'photo' in name and 'document' not in name
 
 
-async def _find_adjacent_image(client, src, quiz_msg):
-    """Find only the immediately preceding single image (message_id - 1)."""
+def image_suffix(msg):
+    if getattr(msg, 'photo', None) is not None:
+        return '.jpg'
+    mime = str(getattr(getattr(msg, 'document', None), 'mime_type', '') or '').lower()
+    return mimetypes.guess_extension(mime) or '.img'
+
+
+async def _find_adjacent_image(client, src, quiz_msg, key=None):
+    """Return the image that sits IMMEDIATELY before the quiz (e.g. id 12 image, id 13 quiz).
+
+    Uses "the nearest previous existing message" (max_id) instead of guessing
+    id-1, so deleted/missing ids in between do not break the pairing. If that
+    previous message is not a single image, the quiz stays image-less.
+    """
     mid = int(getattr(quiz_msg, 'id', 0) or 0)
     if mid <= 1:
         return ''
     try:
-        prev = await GLOBAL_RATE_LIMITER.call(
-            lambda: client.get_messages(src, ids=mid - 1),
+        prevs = await GLOBAL_RATE_LIMITER.call(
+            lambda: client.get_messages(src, limit=1, max_id=mid),
             key='global', retries=4,
         )
-    except errors.RPCError:
-        return ''
+    except errors.RPCError as exc:
+        raise RuntimeError(f'previous message lookup failed: {type(exc).__name__}: {exc}') from exc
+    prev = prevs[0] if prevs else None
     if not _is_single_image_message(prev):
         return ''
 
     root = Path('data') / 'scanner_images'
     root.mkdir(parents=True, exist_ok=True)
-    source_key = hashlib.sha1(str(src).encode('utf-8')).hexdigest()[:16]
+    source_key = hashlib.sha1(str(key or src).encode('utf-8')).hexdigest()[:16]
     folder = root / source_key
     folder.mkdir(parents=True, exist_ok=True)
-    suffix = '.jpg' if getattr(prev, 'photo', None) is not None else '.img'
+    suffix = image_suffix(prev)
     path = folder / f'{int(prev.id)}{suffix}'
     if path.is_file() and path.stat().st_size > 0:
         return str(path)
     try:
-        downloaded = await client.download_media(prev, file=str(path))
-        return str(downloaded) if downloaded else ''
-    except Exception:
+        # Goes through the limiter: a FloodWait here is waited out and retried
+        # instead of silently producing an image-less quiz.
+        downloaded = await GLOBAL_RATE_LIMITER.call(
+            lambda: client.download_media(prev, file=str(path)),
+            key='global', retries=3,
+        )
+    except StopRequested:
+        path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f'image download failed: {type(exc).__name__}: {exc}') from exc
+    if not downloaded:
+        raise RuntimeError('image download returned nothing')
+    return str(downloaded)
+
+
+async def _iter_history(client, peer, full_history, start_id=0):
+    """Yield chat history; survive FloodWait/connection errors and RESUME at the same message.
+
+    A raised FloodWait ends a Telethon iterator, so the iterator is simply
+    re-created from the last message seen once the wait is over.
+    """
+    cursor = int(start_id or 0)
+    transient = 0
+    while True:
+        if full_history:
+            it = client.iter_messages(peer, limit=None, reverse=True, offset_id=cursor)
+        elif cursor:
+            it = client.iter_messages(peer, limit=None, offset_id=cursor)
+        else:
+            it = client.iter_messages(peer, limit=None)
         try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return ''
+            async for msg in it:
+                mid = int(getattr(msg, 'id', 0) or 0)
+                if mid > 0:
+                    cursor = mid
+                transient = 0
+                yield msg
+            return
+        except FLOOD_ERRORS as exc:
+            seconds = max(1, int(getattr(exc, 'seconds', 1) or 1))
+            if seconds > GLOBAL_RATE_LIMITER.max_flood_wait:
+                raise
+            await GLOBAL_RATE_LIMITER.penalize(seconds, 'global')
+            notify_hooks('on_wait', seconds, 'history')
+            await interruptible_sleep(seconds + GLOBAL_RATE_LIMITER.flood_extra)
+            notify_hooks('on_resume')
+        except TRANSIENT_ERRORS:
+            transient += 1
+            if transient > 5:
+                raise
+            await interruptible_sleep(min(30, 2 * transient * transient))
 
 
 async def _send_docx_batch(client, output_chat, records):
     if not records or not output_chat:
         return None
     from utils.exporter import export
-    files = export(records, len(records), 'quiz_test')
+    out_dir = Path(tempfile.mkdtemp(prefix='scan_docx_'))
     sent = 0
     try:
+        files = await asyncio.to_thread(export, records, len(records), 'quiz_test', out_dir)
+        target = await resolve_peer(client, output_chat)
         for path in files:
-            await client.send_file(
-                await client.get_input_entity(output_chat),
-                str(path),
-                caption=f'Quizlar: {len(records)} ta\nManba: {records[0].get("source", "")}',
+            await GLOBAL_RATE_LIMITER.call(
+                lambda p=path: client.send_file(
+                    target,
+                    str(p),
+                    caption=f'Quizlar: {len(records)} ta\nManba: {records[0].get("source", "")}',
+                ),
+                key='send', retries=3,
             )
             sent += 1
     finally:
-        for path in files:
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        shutil.rmtree(out_dir, ignore_errors=True)
     return sent
 
 
@@ -460,30 +538,57 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
     vote_flood_waits_start = VOTE_RATE_LIMITER.flood_waits
     vote_flood_wait_seconds_start = VOTE_RATE_LIMITER.flood_wait_seconds
     batch_records = []
+    image_failures = 0
     state = db.state(src)
 
     full_history = str(scan_mode or 'target').lower() in ('full', 'all', 'history')
     state_last = int(state.get('last_message_id', 0) or 0)
     mode_name = 'FULL_HISTORY' if full_history else 'TARGET'
+    last_seen_id = state_last
+    pin_id = None          # first message whose answer failed for a retryable reason
+
+    def safe_id():
+        """Checkpoint never moves past a retryable failure, so the next run retries it."""
+        return last_seen_id if pin_id is None else max(state_last, pin_id - 1)
+
+    def _on_wait(seconds, key):
+        eta = (datetime.now() + timedelta(seconds=int(seconds) + 3)).strftime('%H:%M:%S')
+        stats.update(status='flood_wait', wait_seconds=int(seconds), resume_at=eta)
+        db.log('WARN', f'⏳ Telegram limiti ({key}): {seconds}s kutiladi, ~{eta} da avtomatik davom etadi')
+
+    def _on_resume():
+        stats.update(status='scanning', wait_seconds=0, resume_at='')
+        db.log('INFO', '▶ Limit tugadi, skan davom etmoqda')
+
+    HOOKS.set(Hooks(stop=stop_event.is_set, on_wait=_on_wait, on_resume=_on_resume))
+
+    async def _flush():
+        nonlocal files_sent
+        if not (batch_records and file_publish_enabled and output_chat):
+            return
+        try:
+            sent = await _send_docx_batch(client, output_chat, batch_records)
+            files_sent += int(sent or 0)
+            db.log('INFO', f'DOCX yuborildi: {output_chat}; {len(batch_records)} quiz; files={sent or 0}')
+            batch_records.clear()
+        except Exception as exc:
+            db.log('ERROR', f'DOCX yuborish xatosi {output_chat}: {type(exc).__name__}: {exc}')
     stats.update(status='starting', source=str(src), found=0, checked=0, skipped=0,
                  published=0, files_sent=0, polls_seen=0, anonymous_quizzes=0,
-                 answer_failures=0, duplicates=0, error='')
+                 answer_failures=0, duplicates=0, error='',
+                 image_failures=0, wait_seconds=0, resume_at='')
     db.log('INFO', f'Scan MODE={mode_name}: {src}; target={target}; checkpoint={state_last}')
 
     try:
-        # Telethon documents reverse=True as oldest -> newest. When resuming a
-        # full-history scan, min_id excludes everything already checkpointed.
-        if full_history:
-            if state_last > 0:
-                iterator = client.iter_messages(src, limit=None, reverse=True, min_id=state_last)
-            else:
-                iterator = client.iter_messages(src, limit=None, reverse=True)
-        else:
-            iterator = client.iter_messages(src, limit=None)
+        # "-100..." typed as text must become an int, and a fresh session needs
+        # its entity cache filled: resolve_peer handles both.
+        peer = await resolve_peer(client, src)
+        # Resumable iterator: FloodWait/connection errors are waited out and the
+        # scan continues from the same message (see _iter_history).
+        iterator = _iter_history(client, peer, full_history, state_last if full_history else 0)
 
         checkpoint_every = 25
         since_checkpoint = 0
-        last_seen_id = state_last
 
         async for msg in iterator:
             if stop_event.is_set():
@@ -498,6 +603,9 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
             checked += 1
             last_seen_id = mid
             since_checkpoint += 1
+            if checked % 200 == 0:
+                db.log('INFO', f'PROGRESS {src}: checked={checked}, found={found}, skipped={skipped}, '
+                               f'answer_failures={answer_failures}, flood_waits={GLOBAL_RATE_LIMITER.flood_waits - flood_waits_start}')
 
             kind = poll_kind(msg)
             if kind != 'none':
@@ -518,7 +626,7 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
             if not data:
                 # Persist progress in full-history mode even across non-quiz runs.
                 if full_history and since_checkpoint >= checkpoint_every:
-                    db.save_state(src, last_message_id=last_seen_id)
+                    db.save_state(src, last_message_id=safe_id())
                     since_checkpoint = 0
                 continue
 
@@ -527,15 +635,16 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
             if db.fp(fp):
                 skipped += 1
                 duplicate_count += 1
-                db.log('INFO', f'SKIP duplicate fingerprint: {src}:{mid}; {q[:80]}')
             else:
                 try:
                     correct, solution, voted_now = await telegram_correct_index(
-                        client, src, msg, poll, answers
+                        client, peer, msg, poll, answers
                     )
                 except errors.RPCError as exc:
                     skipped += 1
                     answer_failures += 1
+                    if full_history and pin_id is None:
+                        pin_id = mid   # retryable: keep the checkpoint before this quiz
                     db.log('WARN', f'Answer RPC failed: {type(exc).__name__}: {exc}; msg_id={mid}; {q[:100]}')
                     correct = None
                 except Exception as exc:
@@ -549,9 +658,11 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
                     try:
                         # Exact rule requested: only the single image immediately
                         # before this quiz (message_id - 1) is attached.
-                        image_path = await _find_adjacent_image(client, src, msg)
+                        image_path = await _find_adjacent_image(client, peer, msg, key=src)
                     except Exception as exc:
-                        db.log('WARN', f'Image pairing failed {src}:{mid}: {type(exc).__name__}: {exc}')
+                        image_failures += 1
+                        stats['image_failures'] = image_failures
+                        db.log('WARN', f'IMAGE LOST (quiz saved without image) {src}:{mid}: {type(exc).__name__}: {exc}')
 
                     record = {
                         'fingerprint': fp,
@@ -575,23 +686,20 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
                     if publish_enabled and output_chat:
                         try:
                             from userbot.publisher import publish_quiz
-                            await publish_quiz(client, output_chat, q, options, int(correct), clean(solution))
+                            await GLOBAL_RATE_LIMITER.call(
+                                lambda: publish_quiz(client, output_chat, q, options, int(correct), clean(solution)),
+                                key='send', retries=3,
+                            )
                             published += 1
                         except Exception as exc:
                             db.log('ERROR', f'Publish failed for {q[:80]}: {type(exc).__name__}: {exc}')
 
                     if file_publish_enabled and output_chat and len(batch_records) >= max(1, int(per_file)):
-                        try:
-                            sent = await _send_docx_batch(client, output_chat, batch_records)
-                            files_sent += int(sent or 0)
-                            db.log('INFO', f'DOCX yuborildi: {output_chat}; {len(batch_records)} quiz; files={sent or 0}')
-                            batch_records.clear()
-                        except Exception as exc:
-                            db.log('ERROR', f'DOCX yuborish xatosi {output_chat}: {type(exc).__name__}: {exc}')
+                        await _flush()
 
             # Checkpoint every N messages, and always on every successful quiz.
             if full_history and (since_checkpoint >= checkpoint_every or correct is not None):
-                db.save_state(src, last_message_id=last_seen_id,
+                db.save_state(src, last_message_id=safe_id(),
                               checked=state.get('checked', 0) + checked,
                               found=state.get('found', 0) + found)
                 since_checkpoint = 0
@@ -611,21 +719,26 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
             await asyncio.sleep(0.35)
 
         if full_history and last_seen_id > 0:
-            db.save_state(src, last_message_id=last_seen_id,
+            db.save_state(src, last_message_id=safe_id(),
                           checked=state.get('checked', 0) + checked,
                           found=state.get('found', 0) + found)
 
-        if batch_records and file_publish_enabled and output_chat:
-            try:
-                sent = await _send_docx_batch(client, output_chat, batch_records)
-                files_sent += int(sent or 0)
-                db.log('INFO', f'DOCX yuborildi: {output_chat}; {len(batch_records)} quiz; files={sent or 0}')
-                batch_records.clear()
-            except Exception as exc:
-                db.log('ERROR', f'DOCX yuborish xatosi {output_chat}: {type(exc).__name__}: {exc}')
+        await _flush()
 
         db.log('INFO', f'SCAN SUMMARY {src}: checked={checked}, polls={polls_seen}, anonymous_quizzes={anonymous_quizzes}, found={found}, duplicates={duplicate_count}, answer_failures={answer_failures}, flood_waits={GLOBAL_RATE_LIMITER.flood_waits - flood_waits_start}, flood_wait_seconds={(GLOBAL_RATE_LIMITER.flood_wait_seconds - flood_wait_seconds_start) + (VOTE_RATE_LIMITER.flood_wait_seconds - vote_flood_wait_seconds_start)}, vote_flood_waits={VOTE_RATE_LIMITER.flood_waits - vote_flood_waits_start}')
 
+    except StopRequested:
+        HOOKS.set(None)
+        stop_event.set()
+        db.log('INFO', 'Skan to‘xtatildi (limit kutilayotganda Stop bosildi)')
+        try:
+            if full_history and last_seen_id > 0:
+                db.save_state(src, last_message_id=safe_id(),
+                              checked=state.get('checked', 0) + checked,
+                              found=state.get('found', 0) + found)
+            await _flush()
+        except Exception:
+            pass
     except errors.FloodWaitError as exc:
         wait = int(getattr(exc, 'seconds', 0))
         stats.update(status='flood_wait', wait_seconds=wait)
@@ -646,5 +759,6 @@ async def scan(client, db, src, target, stop_event, settings, stats, output_chat
                      flood_waits=GLOBAL_RATE_LIMITER.flood_waits - flood_waits_start,
                      flood_wait_seconds=(GLOBAL_RATE_LIMITER.flood_wait_seconds - flood_wait_seconds_start) + (VOTE_RATE_LIMITER.flood_wait_seconds - vote_flood_wait_seconds_start),
                      vote_flood_waits=VOTE_RATE_LIMITER.flood_waits - vote_flood_waits_start)
+        HOOKS.set(None)
     return found
 

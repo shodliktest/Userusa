@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,7 @@ from userbot.scanner import (
     fingerprint,
     forwarded_origin,
     is_poll_message,
+    image_suffix,
     poll_from_message,
     telegram_correct_index,
 )
@@ -65,10 +68,55 @@ def _is_image_message(msg: Any) -> bool:
 
 
 class IntakeManager:
-    def __init__(self, db, base_dir="data/intake"):
+    def __init__(self, db, base_dir="data/intake", on_change=None):
         self.db = db
         self.base = Path(base_dir)
         self.base.mkdir(parents=True, exist_ok=True)
+        self._on_change = on_change
+        self._locks = {}
+
+    def _changed(self):
+        if self._on_change:
+            try:
+                self._on_change()
+            except Exception:
+                pass
+
+    def _lock(self, uid: int) -> asyncio.Lock:
+        lock = self._locks.get(uid)
+        if lock is None:
+            lock = self._locks[uid] = asyncio.Lock()
+        return lock
+
+    def _image_path(self, uid: int, msg) -> Path:
+        return self._user_dir(uid) / f"img_{int(msg.id)}{image_suffix(msg)}"
+
+    async def _download_image(self, client, msg, path: Path) -> str:
+        if path.is_file() and path.stat().st_size > 0:
+            return str(path)
+        got = await client.download_media(msg, file=str(path))
+        return str(got) if got else ""
+
+    async def _paired_image(self, client, event, uid: int, quiz_msg) -> str:
+        """Image that sits IMMEDIATELY above this quiz in the chat.
+
+        Messages the bot itself sent ("Rasm qabul qilindi" replies) are skipped,
+        so  image(12) -> [bot reply] -> quiz(13)  still pairs 12 with 13.
+        No FIFO guessing: a quiz without an image right above it stays image-less.
+        """
+        recent = await client.get_messages(event.chat_id, limit=8, max_id=int(quiz_msg.id))
+        prev = next((m for m in recent if not getattr(m, "out", False)), None)
+        if prev is None or not _is_image_message(prev):
+            return ""
+        pending = self.db.intake_take_pending_image_for_message(uid, int(prev.id))
+        if pending and Path(pending).is_file():
+            return pending
+        return await self._download_image(client, prev, self._image_path(uid, prev))
+
+    def _drop_pending(self, uid: int):
+        for pending in self.db.intake_pending_paths(uid):
+            Path(pending).unlink(missing_ok=True)
+        self.db.intake_clear(uid)
 
     def _user_dir(self, user_id: int | str) -> Path:
         p = self.base / str(user_id)
@@ -114,8 +162,13 @@ class IntakeManager:
     async def handle(self, client, event) -> bool:
         if not event.is_private:
             return False
-
         uid = int(event.sender_id)
+        # One user's messages are processed strictly in order: a quiz still being
+        # processed can never be overtaken by the YAKUNLASH sent right after it.
+        async with self._lock(uid):
+            return await self._handle_locked(client, event, uid)
+
+    async def _handle_locked(self, client, event, uid: int) -> bool:
         text = clean(event.raw_text or "").strip()
 
         if text.upper() == COMMAND_INFO:
@@ -130,14 +183,13 @@ class IntakeManager:
         # 1) Image intake. Use a FIFO queue so rapid batches do not overwrite
         # earlier images: image1->quiz1, image2->quiz2, ...
         if _is_image_message(msg):
-            suffix = ".jpg" if getattr(msg, "photo", None) is not None else ".img"
-            path = self._user_dir(uid) / f"pending_{msg.id}{suffix}"
             try:
-                downloaded = await client.download_media(msg, file=str(path))
+                downloaded = await self._download_image(client, msg, self._image_path(uid, msg))
                 if not downloaded:
                     await event.reply("❌ Rasmni qabul qilib bo‘lmadi. Qaytadan yuboring.")
                     return True
                 self.db.intake_add_pending_image(uid, int(msg.id), str(downloaded))
+                self._changed()
                 st = self.db.intake_stats(uid)
                 await event.reply(
                     "🖼 Rasm qabul qilindi. Keyingi viktorinaga biriktiriladi.\n"
@@ -207,27 +259,14 @@ class IntakeManager:
             await event.reply("❌ Telegram to‘g‘ri javobni qaytarmadi. Bu viktorinani qabul qila olmadim.")
             return True
 
-        # Pairing is deliberately message-ID aware. If the immediately previous
-        # private-chat message is a single image, that exact image belongs to this
-        # quiz (the same rule used by the channel scanner). Only if there is no
-        # immediate image do we fall back to the FIFO queue.
-        pending_image = ""
+        # Exact pairing: the image directly above this quiz (see _paired_image).
         try:
-            previous = await client.get_messages(event.chat_id, ids=int(msg.id) - 1) if int(msg.id) > 1 else None
-            if previous is not None and _is_image_message(previous):
-                pending_image = self.db.intake_take_pending_image_for_message(uid, int(previous.id))
-                if not pending_image:
-                    suffix = ".jpg" if getattr(previous, "photo", None) is not None else ".img"
-                    pth = self._user_dir(uid) / f"pending_{previous.id}{suffix}"
-                    downloaded = await client.download_media(previous, file=str(pth))
-                    if downloaded:
-                        pending_image = str(downloaded)
-                        self.db.log("INFO", f"Intake paired exact previous image: uid={uid}; image_msg_id={previous.id}; quiz_msg_id={msg.id}")
-            if not pending_image:
-                pending_image = self.db.intake_take_pending_image(uid)
+            pending_image = await self._paired_image(client, event, uid, msg)
         except Exception as exc:
-            self.db.log("WARN", f"Intake image pairing uid={uid}; quiz_msg_id={msg.id}: {exc}")
-            pending_image = self.db.intake_take_pending_image(uid)
+            pending_image = ""
+            self.db.log("WARN", f"Intake image pairing uid={uid}; quiz_msg_id={msg.id}: {type(exc).__name__}: {exc}")
+        if pending_image:
+            self.db.log("INFO", f"Intake paired image: uid={uid}; quiz_msg_id={msg.id}; image={Path(pending_image).name}")
 
         record = {
             "user_id": uid,
@@ -249,6 +288,7 @@ class IntakeManager:
             return True
 
         self.db.intake_add(uid, record)
+        self._changed()
         st = self.db.intake_stats(uid)
         image_word = "rasmli" if pending_image else "rasmsiz"
         await event.reply(
@@ -272,34 +312,41 @@ class IntakeManager:
         )
 
     async def finish(self, client, event, uid: int):
-        rows = self.db.intake_items(uid)
+        # Claim the batch first: it is removed from the DB in one transaction, so
+        # it can never be added to the NEXT collection, whatever happens below.
+        rows = self.db.intake_claim(uid)
         if not rows:
-            for pending in self.db.intake_pending_paths(uid):
-                Path(pending).unlink(missing_ok=True)
-            self.db.intake_clear(uid)
+            self._drop_pending(uid)
+            self._changed()
             await event.reply("ℹ️ Hozircha birorta viktorina qabul qilinmagan.")
             return
 
         await event.reply(f"⏳ {len(rows)} ta viktorinadan Word fayl tayyorlanmoqda...")
         from utils.exporter import export
 
+        out_dir = self._user_dir(uid) / f"out_{int(time.time() * 1000)}"
         try:
-            files = export(rows, max(1, len(rows)), "quiz_test")
+            files = await asyncio.to_thread(export, rows, max(1, len(rows)), "quiz_test", out_dir)
             for path in files:
                 await client.send_file(
                     event.chat_id,
                     str(path),
                     caption=f"✅ Yakunlandi: {len(rows)} ta viktorina",
                 )
-                path.unlink(missing_ok=True)
-            self._cleanup_images(rows)
-            for pending in self.db.intake_pending_paths(uid):
-                Path(pending).unlink(missing_ok=True)
-            self.db.intake_clear(uid)
-            await event.reply("✅ Tayyor. Yig‘im tozalandi, yangi viktorinalarni yuborishingiz mumkin.")
         except Exception as exc:
-            self.db.log("ERROR", f"Intake finish uid={uid}: {exc}")
-            await event.reply("❌ Word fayl yaratishda xatolik yuz berdi. Yig‘ilgan viktorinalar o‘chirilmagan.")
+            # Nothing was delivered: put the batch back so no quiz is lost.
+            self.db.log("ERROR", f"Intake finish uid={uid}: {type(exc).__name__}: {exc}")
+            self.db.intake_restore(uid, rows)
+            self._changed()
+            await event.reply("❌ Word fayl yuborilmadi. Viktorinalar saqlab qolindi, YAKUNLASH ni qayta yozing.")
+            return
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+        self._cleanup_images(rows)
+        self._drop_pending(uid)
+        self._changed()
+        await event.reply("✅ Tayyor. Yangi yig‘im boshlandi — yuborilgan viktorinalar endi keyingi Wordga qo‘shilmaydi.")
 
     def _cleanup_images(self, rows):
         for row in rows:
