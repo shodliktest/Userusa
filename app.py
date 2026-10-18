@@ -83,7 +83,7 @@ with t[1]:
         st.rerun()
 
     status = w.stats.get('status', 'stopped')
-    labels = {'starting': '🟡 boshlanmoqda', 'scanning': '🟢 ishlayapti', 'stopping': '🟠 to‘xtatilmoqda', 'stopped': '⚪ to‘xtagan', 'completed': '🔵 tugagan', 'flood_wait': '🟠 Telegram FloodWait', 'error': '🔴 xato'}
+    labels = {'starting': '🟡 boshlanmoqda', 'scanning': '🟢 ishlayapti', 'stopping': '🟠 to‘xtatilmoqda', 'stopped': '⚪ to‘xtagan', 'completed': '🔵 tugagan', 'flood_wait': '⏳ Telegram limiti: kutilmoqda, o‘zi davom etadi', 'error': '🔴 xato'}
     st.write('**Scanner holati:**', labels.get(status, status))
     if w.stats.get('source'):
         st.write('**Manba:**', w.stats['source'])
@@ -96,6 +96,10 @@ with t[1]:
     m6.metric('Anonim quiz', w.stats.get('anonymous_quizzes', 0))
     m7.metric('Javob xatosi', w.stats.get('answer_failures', 0))
     m8.metric('FloodWait', w.stats.get('flood_waits', 0))
+    if status == 'flood_wait' and w.stats.get('wait_seconds'):
+        st.info(f"⏳ Telegram {w.stats['wait_seconds']} soniya kutishni talab qildi. ~{w.stats.get('resume_at', '')} da avtomatik davom etadi (Stop bosilsa to‘xtaydi).")
+    if w.stats.get('image_failures'):
+        st.warning(f"Rasmi yuklanmagan quizlar: {w.stats['image_failures']} (logda 'IMAGE LOST').")
     if w.stats.get('error'):
         st.error(w.stats['error'])
     st.caption('Statusni yangilash uchun “🔄 HOLATNI YANGILASH” tugmasini bosing. Quiz javobi Telegram pollResults orqali olinadi. FloodWait bo‘lsa bot Telegram aytgan vaqtni kutib, qayta urinadi; shuning uchun vaqt tezlikdan ustun qo‘yilgan.')
@@ -115,6 +119,12 @@ with t[2]:
 with t[3]:
     for label, tbl in [('Quizlar', 'quizzes'), ('Fingerprintlar', 'fingerprints'), ('Buyurtmalar', 'orders')]:
         st.metric(label, db.count(tbl))
+
+    b = w.backup
+    if not b.enabled:
+        st.warning('STORAGE_CHANNEL berilmagan: ma’lumotlar qayta ishga tushganda yo‘qoladi.')
+    else:
+        st.caption(f"☁️ Telegram zaxira: oxirgi = {b.last_ok or 'hali yo‘q'} | xato: {b.last_error or 'yo‘q'}")
 
 with t[4]:
     st.text_area('Log', db.logs(), height=550)
