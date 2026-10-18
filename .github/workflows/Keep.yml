@@ -1,0 +1,92 @@
+name: Quizmakerbot 
+
+on:
+  schedule:
+    # Har 30 daqiqada tekshiradi
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  browser_ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Pythonni sozlash
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Playwright o'rnatish
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Brauzerda uyg'otish tugmasini bosish
+        run: |
+          python -c "
+          from playwright.sync_api import sync_playwright
+          import time
+
+          def run_wakeup():
+              with sync_playwright() as p:
+                  # Brauzerni haqiqiy foydalanuvchi sifatida ishga tushirish
+                  browser = p.chromium.launch(headless=True)
+                  context = browser.new_context(
+                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+                  )
+                  page = context.new_page()
+                  
+                  # SIZNING YANGI LINKINGIZ:
+                  url = 'https://userusa-tco.streamlit.app/'
+                  
+                  for attempt in range(1, 4):
+                      print(f'🚀 Urinish #{attempt}: {url} ga kirilmoqda...')
+                      try:
+                          page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                          time.sleep(10) # Streamlit elementlari chizilishi uchun kutamiz
+
+                          button_text = 'Yes, get this app back up!'
+                          
+                          # Barcha tugmalarni chuqur qidirish
+                          buttons = page.query_selector_all('button')
+                          found = False
+                          
+                          for btn in buttons:
+                              if button_text.lower() in btn.inner_text().lower():
+                                  print(f'🔔 Uygʻotish tugmasi matn orqali topildi! Bosilmoqda...')
+                                  btn.click()
+                                  found = True
+                                  break
+                          
+                          if not found:
+                              # Locator orqali zaxira qidiruv
+                              btn = page.locator(f'button:has-text(\"{button_text}\")')
+                              if btn.is_visible():
+                                  print('🔔 Uygʻotish tugmasi locator orqali topildi! Bosilmoqda...')
+                                  btn.click()
+                                  found = True
+
+                          if found:
+                              print('⏳ Tugma bosildi, Streamlit uygʻonishi uchun 45 soniya kutilmoqda...')
+                              time.sleep(45)
+                              page.reload(wait_until='networkidle')
+                          else:
+                              print('✅ Tugma topilmadi. Sahifa allaqachon uygʻoq!')
+
+                          print(f'🎉 Muvaffaqiyat! Sahifa sarlavhasi: {page.title()}')
+                          browser.close()
+                          return True
+                          
+                      except Exception as e:
+                          print(f'⚠️ Xato yuz berdi: {str(e)[:100]}')
+                          time.sleep(15)
+                  
+                  browser.close()
+                  return False
+
+          if not run_wakeup():
+              print('❌ 3 marta urinishdan keyin ham sahifani ochib boʻlmadi.')
+              exit(1)
+          "
+          
